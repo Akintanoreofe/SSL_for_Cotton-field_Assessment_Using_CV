@@ -23,11 +23,15 @@ The datasets required to run the pre-training and downstream evaluation codes ca
 
 ## Repository Contents
 
-* `pretraining/` - Scripts for LeJEPA pre-training with dense spatial prediction losses tailored for the YOLOv8 backbone.
-* `evaluation_detection/` - Fine-tuning scripts for the cotton boll bounding box detection downstream task.
-* `evaluation_classification/` - Scripts for organizing XML annotations, extracting embeddings, and training the linear probe for plot status classification.
-* `figures/` - Generated outputs including PCA embeddings, confusion matrices, and bounding box overlap visualizers.
-* `docs/` - Methodological documentation and LaTeX source files detailing the theoretical framework and error analysis.
+* `Cotton_Boll_Detection_Figures/` - Directory containing visual outputs showing the prediction bounding box overlaps (true vs. predicted labels) for the cotton boll detection task.
+* "Plot_Classification_Figures` - Directory containing PCA embedding plots and confusion matrices for the defoliated plot status classification task.
+* `Evaluation_Plot_Status.py` - Script for evaluating plot status on the defoliated cotton field using a linear probe on the frozen backbone.
+* `evaluation_analytics_head.py` - Script for end-to-end fine-tuning and evaluation of the YOLOv8 model for cotton boll detection.
+* `lejepa_pretraining_cotton_ball.py` - The main pre-training script implementing the LeJEPA architecture with dense spatial prediction loss.
+* `dense_lejepa_yolov8_cotton_50k_checkpoint.pth` - The saved pre-trained model weights resulting from the 50,000-image multi-camera pre-training phase.
+* `Akintan_Methodological Documentation_ Self-Supervised Pre-Training of YOLOv8 via LeJEPA for Downstream Agricultural Phenotyping Tasks.pdf` - Compiled methodological documentation detailing the theoretical framework and error analysis.
+* `Methodological Documentation: Self-Supervised Pre-Training of YOLOv8 via LeJEPA for Downstream Agricultural Phenotyping Tasks.tex` - LaTeX source file for the documentation.
+* `README.md` - This repository overview file.
 
 ## Acknowledgments and Citations
 
