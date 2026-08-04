@@ -21,16 +21,6 @@ The datasets required to run the pre-training and downstream evaluation codes ca
 
 *Note: The pre-training phase utilizes a subset (50,000 images) of the MARS-X multi-camera dataset to optimize computational overhead, leveraging physical camera angles tailored for top-down and oblique canopy perspectives.*
 
-## Repository Contents
-
-* `Cotton_Boll_Detection_Figures/` - Directory containing visual outputs showing the prediction bounding box overlaps (true vs. predicted labels) for the cotton boll detection task.
-* "Plot_Classification_Figures` - Directory containing PCA embedding plots and confusion matrices for the defoliated plot status classification task.
-* `Evaluation_Plot_Status.py` - Script for evaluating plot status on the defoliated cotton field using a linear probe on the frozen backbone.
-* `evaluation_analytics_head.py` - Script for end-to-end fine-tuning and evaluation of the YOLOv8 model for cotton boll detection.
-* `lejepa_pretraining_cotton_ball.py` - The main pre-training script implementing the LeJEPA architecture with dense spatial prediction loss.
-* `dense_lejepa_yolov8_cotton_50k_checkpoint.pth` - The saved pre-trained model weights resulting from the 50,000-image multi-camera pre-training phase.
-* `README.md` - This repository overview file.
-
 ## Acknowledgments and Citations
 
 This project builds upon and draws inspiration from the foundational contrastive learning and multi-camera plant phenotyping research conducted by Daniel Petti and the UGA-BSAIL team. 
