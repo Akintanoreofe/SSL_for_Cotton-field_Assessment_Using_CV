@@ -29,8 +29,6 @@ The datasets required to run the pre-training and downstream evaluation codes ca
 * `evaluation_analytics_head.py` - Script for end-to-end fine-tuning and evaluation of the YOLOv8 model for cotton boll detection.
 * `lejepa_pretraining_cotton_ball.py` - The main pre-training script implementing the LeJEPA architecture with dense spatial prediction loss.
 * `dense_lejepa_yolov8_cotton_50k_checkpoint.pth` - The saved pre-trained model weights resulting from the 50,000-image multi-camera pre-training phase.
-* `Akintan_Methodological Documentation_ Self-Supervised Pre-Training of YOLOv8 via LeJEPA for Downstream Agricultural Phenotyping Tasks.pdf` - Compiled methodological documentation detailing the theoretical framework and error analysis.
-* `Methodological Documentation: Self-Supervised Pre-Training of YOLOv8 via LeJEPA for Downstream Agricultural Phenotyping Tasks.tex` - LaTeX source file for the documentation.
 * `README.md` - This repository overview file.
 
 ## Acknowledgments and Citations
