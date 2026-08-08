@@ -1,0 +1,26 @@
+# Deep Learning & Vision Models
+torch
+torchvision
+torchmetrics
+ultralytics
+transformers
+
+# Image Processing
+Pillow
+opencv-python
+
+# Data Manipulation & Scientific Computing
+numpy
+pandas
+scikit-learn
+
+# Visualization
+matplotlib
+seaborn
+plotly
+
+# Hyperparameter Tuning
+optuna
+
+# Utilities
+tqdm
