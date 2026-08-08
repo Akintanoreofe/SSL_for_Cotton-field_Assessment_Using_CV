@@ -19,7 +19,7 @@ The pre-trained YOLOv8 backbone is evaluated on two distinct downstream agricult
 The datasets required to run the pre-training and downstream evaluation codes can be found and downloaded from the BSAIL data repository:
 * **Dataset Link:** [https://uflbsail.net/data/](https://uflbsail.net/data/)
 
-*Note: The pre-training phase utilizes a subset (50,000 images) of the MARS-X multi-camera dataset to optimize computational overhead, leveraging physical camera angles tailored for top-down and oblique canopy perspectives.*
+*Note: The pre-training phase utilizes a subset (50,000 images) of the MARS-X multi-camera dataset.*
 
 ## Acknowledgments and Citations
 
