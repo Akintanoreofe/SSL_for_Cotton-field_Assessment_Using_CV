@@ -1,0 +1,27 @@
+[project]
+site_name = "LeJEPA_Cotton_Field_Assessment"
+site_url = "https://Akintanoreofe.github.io/LeJEPA_Cotton_Field_Assessment/"
+repo_url = "https://github.com/Akintanoreofe/LeJEPA_Cotton_Field_Assessment"
+repo_name = "Akintanoreofe/LeJEPA_Cotton_Field_Assessment"
+
+nav = [
+  { "Home" = "index.md" },
+  { "Installation" = "installation.md" },
+  { "Usage" = "usage.md" },
+  { "API Reference" = "api.md" },
+]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+toggle.icon = "material/brightness-7"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+toggle.icon = "material/brightness-4"
+toggle.name = "Switch to light mode"
+
+[project.plugins.mkdocstrings.handlers.python]
+paths = ["src"]
