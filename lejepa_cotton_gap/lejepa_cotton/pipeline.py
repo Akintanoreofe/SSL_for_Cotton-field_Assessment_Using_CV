@@ -155,7 +155,7 @@ def run_detection_evaluation(cfg: DetectionEvalConfig, max_overlays: int = 20) -
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     device = ultralytics_device(select_device(cfg.device))
     data_yaml = prepare_detection_split(cfg.source_dir, cfg.split_dir, cfg.class_names,
-                                        cfg.val_ratio, cfg.subset_ratio, cfg.seed, cfg.split_by)
+                                        cfg.val_ratio, cfg.max_train_images, cfg.seed, cfg.split_by)
     rows, run_dirs = [], {}
     for variant in cfg.variants:
         init_weights = detection_init_weights(variant, cfg.weights, cfg.init_dir)

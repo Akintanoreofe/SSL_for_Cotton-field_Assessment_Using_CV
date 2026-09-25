@@ -1,37 +1,128 @@
-# Self-Supervised Pre-Training of YOLOv8 via LeJEPA for Agricultural Phenotyping
+# lejepa-cotton
 
-This repository contains the codebase, evaluation scripts, and experimental figures for the methodological study on **Self-Supervised Pre-Training of YOLOv8 via LeJEPA**. The project explores non-contrastive self-supervised learning for agricultural computer vision, specifically focusing on downstream tasks like cotton boll detection and defoliated plot status classification.
+Cross-camera **LeJEPA** self-supervised pretraining of a **YOLOv8n** backbone with **global average pooling (GAP)**, evaluated against **COCO** weights on cotton-boll detection and plot-status classification.
 
-## Overview
+## Repository layout
 
-Agricultural computer vision pipelines often face data scarcity due to the high labor costs associated with manual annotations in outdoor field environments. This project mitigates this limitation by pre-training a YOLOv8 convolutional backbone on unannotated multi-camera field images using the **LeJEPA** (Joint-Embedding Predictive Architecture with Sketched Isotropic Gaussian Regularization) framework. 
+```
+lejepa_cotton_gap/
+├── setup.py
+├── README.md
+├── run_pipeline.py                  # script: configs + calls only
+├── notebooks/
+│   └── run_gap_lejepa_pipeline.ipynb  # notebook: configs + calls only
+└── lejepa_cotton/
+    ├── __init__.py
+    ├── core_pretraining.py          # data, encoder, loss, training, checkpoints
+    ├── core_evaluation.py           # detection fine-tuning + linear probe
+    ├── visualization.py             # every plot
+    └── pipeline.py                  # runners that wire the three modules together
+```
 
-Unlike traditional contrastive approaches (e.g., SimCLR, MoCo) that rely on negative pairs, this approach grounds self-supervised prediction in optimal distribution theory using **SIGReg**. To adapt this for object detection, the project implements a **Dense Multi-Scale Prediction Loss** across the spatial feature grids ($P_3, P_4, P_5$) while strictly utilizing non-geometric augmentations (blur, noise, color jitter) to preserve pixel-to-pixel coordinate alignment.
+Each module has one job, and shared helpers are defined once and imported. For example, `load_rgb`, `list_images` and `build_eval_transform` live in `core_pretraining`. `read_yolo_labels` and `extract_embeddings` live in `core_evaluation`. No core module contains a hard-coded directory: paths only enter through the config dataclasses, which are filled in by the notebook or `run_pipeline.py`.
 
-## Downstream Tasks
+## Installation
 
-The pre-trained YOLOv8 backbone is evaluated on two distinct downstream agricultural tasks:
-1. **Object Detection (Cotton Boll Detection):** End-to-end fine-tuning of the pre-trained backbone, neck, and detection head for bounding box regression.
-2. **Image Classification (Plot Status Classification):** Linear probing on a frozen backbone to classify defoliated cotton fields into three categories: `in_plot`, `between_plots`, and `headland`.
+**From GitHub (works in a VS Code "GitHub remote repository" workspace):**
 
-## Datasets
+```bash
+pip install --force-reinstall --no-deps "git+https://github.com/Akintanoreofe/SSL_for_Cotton-field_Assessment_Using_CV.git@Packaging#subdirectory=lejepa_cotton_gap"
+```
 
-The datasets required to run the pre-training and downstream evaluation codes can be found and downloaded from the BSAIL data repository:
-* **Dataset Link:** [https://uflbsail.net/data/](https://uflbsail.net/data/)
+The first install needs the dependencies, so leave out `--no-deps` that time. `--force-reinstall` makes pip pick up new commits even though the version number is unchanged. Restart the Jupyter kernel afterwards.
 
-*Note: The pre-training phase utilizes a subset (50,000 images) of the MARS-X multi-camera dataset.*
+**From a local clone (recommended while developing):**
 
-## Acknowledgments and Citations
+```bash
+git clone -b Packaging https://github.com/Akintanoreofe/SSL_for_Cotton-field_Assessment_Using_CV.git
+cd SSL_for_Cotton-field_Assessment_Using_CV/lejepa_cotton_gap
+pip install -e . --config-settings editable_mode=compat
+```
 
-This project builds upon and draws inspiration from the foundational contrastive learning and multi-camera plant phenotyping research conducted by Daniel Petti and the UGA-BSAIL team. 
+`editable_mode=compat` installs a plain path entry that VS Code/Pylance can follow, so hover docstrings and go-to-definition work.
 
-**Source Repository:** Please visit the original contrastive learning repository that inspired the multi-camera sampling approach used in this project:
-[UGA-BSAIL / self-supervised-learning](https://github.com/UGA-BSAIL/self-supervised-learning)
+Python ≥ 3.9, PyTorch ≥ 2.0, torchvision ≥ 0.16, Ultralytics ≥ 8.1.
 
-**Relevant Citations:**
+**Paths:** use absolute paths in the notebook. A Jupyter kernel launched from a virtual workspace starts in `/`, which is read-only on macOS.
 
-If you use this code or the associated datasets, please cite the following foundational work:
+## Method
 
-* **Petti, D., Li, C., & Liu, N. (2026).** *Contrastive multi-view representation learning for multi-camera plant phenotyping: A cotton field study.* Plant Phenomics, 8(2), 100193.
-* **Balestriero, R., & LeCun, Y. (2025).** *LeJEPA: Provable and Scalable Self-Supervised Learning Without the Heuristics.* arXiv preprint arXiv:2511.08544.
-* **Wang, X., Zhang, R., Shen, C., Kong, T., & Li, L. (2021).** *Dense contrastive learning for self-supervised visual pre-training.* In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) (pp. 8514-8523).
+**Data.** Files are named `clip<n>_cam<k>_frame<m>.jpg`. `discover_camera_groups` groups images that share the same `clip` and `frame` and keeps only frames seen by *all* requested cameras. The default cameras are `(1, 2, 4)`, which are the 2nd, 3rd and 5th physical cameras. One training sample is one synchronised frame, and its views are the camera images, each augmented independently. `views_per_camera > 1` adds extra augmentations per camera.
+
+**Encoder.** `YOLOv8MultiScaleBackbone` takes layers 0–9 of `yolov8n.yaml`, so it starts from empty, randomly initialised weights, and returns the P3/P4/P5 feature maps. `YOLOv8GAPEncoder` global-average-pools each scale to a vector and passes it through its own 3-layer MLP projector.
+
+**Objective** (per scale, then averaged):
+
+- *Cross-camera prediction loss*: every view of camera *c* is regressed onto the mean embedding of the **other** cameras of the same frame. The invariance being learned is therefore between viewpoints, not only between augmentations of one image.
+- *SIGReg*: a sliced Epps–Pulley test pushes the embedding distribution toward an isotropic Gaussian, which prevents collapse.
+- `loss = (1 − λ)·prediction + λ·SIGReg`, with λ = 0.2 by default.
+
+**Export.** `export_backbone_to_yolo` writes a real Ultralytics `.pt` checkpoint whose layers 0–9 are the pretrained backbone. This step matters. `YOLO("yolov8n.yaml").train()` rebuilds the network from scratch, so weights copied into a YAML-built model in memory are silently discarded.
+
+## Evaluation variants
+
+| variant | backbone | neck + head |
+|---|---|---|
+| `lejepa` | cross-camera GAP LeJEPA | random |
+| `coco` | COCO `yolov8n.pt` | COCO |
+| `coco_backbone` | COCO | random (like-for-like control for `lejepa`) |
+| `scratch` | random (`yolov8n.yaml`) | random |
+
+The default comparison is `("lejepa", "coco")`. In detection, `coco` also brings a pretrained neck and head, so add `coco_backbone` when you want a comparison that isolates the backbone.
+
+1. **Detection fine-tuning** (`run_detection_evaluation`). The pipeline builds one reproducible train/val split, fine-tunes every variant with identical hyper-parameters, and reports precision, recall, mAP50 and mAP50-95. Validation uses Ultralytics' default low confidence threshold so that mAP is computed over the whole precision–recall curve. The `conf` setting only affects the drawn overlays.
+2. **Linear probe** (`run_probe_evaluation`). The backbone is frozen, and its BatchNorm layers are kept in eval mode. A linear layer is trained on the concatenated P3/P4/P5 GAP vectors using a stratified split, and the pipeline reports accuracy, macro-F1 and a confusion matrix. Model selection uses the lowest test loss, which mirrors the original protocol. Use a separate validation split if you need an unbiased estimate.
+
+## Usage
+
+**Notebook.** Open `notebooks/run_gap_lejepa_pipeline.ipynb`, edit the *Paths* cell, and run the cells top to bottom.
+
+**Script.** Edit the paths at the top of `run_pipeline.py`, then run:
+
+```bash
+python run_pipeline.py
+```
+
+**Python API:**
+
+```python
+from lejepa_cotton import PretrainConfig, WeightSources, DetectionEvalConfig, run_pretraining, run_detection_evaluation
+
+pre = PretrainConfig(image_root="path/to/mars_multi_camera_boll", output_dir="outputs/pretraining", max_samples=16_667)
+ckpt, history = run_pretraining(pre)
+
+det = DetectionEvalConfig(source_dir="path/to/image_dataset", output_dir="outputs/detection",
+                          weights=WeightSources(lejepa_checkpoint=ckpt), variants=("lejepa", "coco"))
+summary = run_detection_evaluation(det)
+```
+
+## Outputs
+
+```
+outputs/
+├── pretraining/
+│   ├── gap_lejepa_yolov8n.pth         # encoder weights + rebuild args + config
+│   ├── loss_history.csv
+│   └── plots/{loss_curves.png, pca_3d/pca_epoch_XXX.html}   # PCA coloured by camera
+├── detection/
+│   ├── split_dataset/  init_weights/  runs/<variant>/
+│   ├── detection_summary.csv
+│   ├── overlays/<variant>/            # green = GT, red = prediction
+│   └── plots/{detection_metrics.png, detection_curves.png}
+└── plot_status_probe/
+    ├── probe_summary.csv, probe_history_<variant>.csv
+    └── plots/{probe_metrics.png, probe_loss_curves.png, confusion_*.png, pca2d_*.png, pca3d_*.html}
+```
+
+## Data expectations
+
+- **Pretraining:** a folder (searched recursively) of multi-camera JPEGs named `clip<n>_cam<k>_frame<m>.jpg`. Images with the same `clip` and `frame` are assumed to be synchronised. Change `filename_pattern` if your naming differs; it must keep the named groups `clip`, `cam` and `frame`.
+- **Detection:** YOLO text labels (`class xc yc w h`). Any of these layouts works, searched recursively:
+  - a folder of sub-datasets, each with `images/` and `labels/` (e.g. `014/images`, `014/labels`, `ssl_active_1/...`);
+  - a single `images/` + `labels/` pair;
+  - labels next to their images.
+
+  Images without boxes are skipped. Byte-identical images that appear in several sub-datasets are kept once. Split files are renamed `<subfolder>__<name>` so equal file names from different sub-datasets never overwrite each other. Stray list files (`014.txt`) and `.yaml` files in the root are ignored. Set `split_by="folder"` to keep each sub-dataset wholly in train or validation. Keep `output_dir` outside the dataset folder.
+- **Plot status:** a folder with the images and a JSON annotation file, found automatically (`annotations.json` if present, otherwise the only `.json`). Accepted shapes: `{"img.jpg": "in_plot"}`, `{"img.jpg": {"label": "in_plot"}}`, or a list of `{"file_name": ..., "label": ...}` records. Labels are matched case-insensitively, with spaces or hyphens treated as underscores.
+
+Run `find_labeled_pairs(DETECTION_DATA)` and `PlotStatusDataset(PLOT_STATUS_DIR, None, label_mapping, transform=None)` to check both datasets in seconds before training.

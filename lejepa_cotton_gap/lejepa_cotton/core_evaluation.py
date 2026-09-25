@@ -431,7 +431,7 @@ def prepare_detection_split(
     split_dir: Path,
     class_names: Sequence[str],
     val_ratio: float = 0.2,
-    subset_ratio: float = 1.0,
+    max_train_images: Optional[int] = 200,
     seed: int = 42,
     split_by: str = "image",
 ) -> Path:
@@ -448,8 +448,10 @@ def prepare_detection_split(
         Class names; a single name forces every label to class ``0``.
     val_ratio : float, default=0.2
         Validation fraction.
-    subset_ratio : float, default=1.0
-        Fraction of all unique labelled images to keep.
+    max_train_images : int or None, default=200
+        Number of training images kept after splitting (low-label regime);
+        ``None`` keeps them all. The validation split is never reduced, so
+        every training-set size is scored on the same images.
     seed : int, default=42
         Seed for subsetting and splitting.
     split_by : {"image", "folder"}, default="image"
@@ -466,8 +468,10 @@ def prepare_detection_split(
     if split_dir.exists():
         shutil.rmtree(split_dir)
     pairs = find_labeled_pairs(source_dir)
-    pairs = subsample(pairs, max(1, int(len(pairs) * subset_ratio)), seed)
     train_pairs, val_pairs = split_pairs(pairs, source_dir, val_ratio, seed, split_by)
+    available = len(train_pairs)
+    train_pairs = subsample(train_pairs, max_train_images, seed)
+    print(f"Training images: {len(train_pairs)} of {available} available")
     single_class = len(class_names) == 1
     for name, subset in (("train", train_pairs), ("val", val_pairs)):
         copy_pairs(subset, source_dir, split_dir / "images" / name, split_dir / "labels" / name, single_class)
@@ -504,8 +508,9 @@ class DetectionEvalConfig:
         Variants to fine-tune and compare.
     val_ratio : float, default=0.2
         Validation fraction.
-    subset_ratio : float, default=1.0
-        Fraction of labelled images used.
+    max_train_images : int or None, default=200
+        Training images used for fine-tuning, drawn after the split so the
+        validation set stays fixed; ``None`` uses all of them.
     split_by : {"image", "folder"}, default="image"
         ``"image"`` splits images at random; ``"folder"`` keeps each top-level
         sub-folder (sequence) wholly in train or validation.
@@ -549,7 +554,7 @@ class DetectionEvalConfig:
     class_names: Tuple[str, ...] = ("cotton_boll",)
     variants: Tuple[str, ...] = ("lejepa", "coco")
     val_ratio: float = 0.2
-    subset_ratio: float = 1.0
+    max_train_images: Optional[int] = 200
     split_by: str = "image"
     image_size: int = 256
     batch_size: int = 16
@@ -941,6 +946,9 @@ class ProbeEvalConfig:
         Dropout before the linear layer.
     test_ratio : float, default=0.5
         Stratified test fraction.
+    max_train_images : int or None, default=200
+        Training images for the probe, drawn with stratification after the
+        split so the test set stays fixed; ``None`` uses all of them.
     num_workers : int, default=0
         DataLoader workers.
     seed : int, default=48
@@ -964,6 +972,7 @@ class ProbeEvalConfig:
     weight_decay: float = 1.009744159203988e-06
     dropout: float = 0.3
     test_ratio: float = 0.5
+    max_train_images: Optional[int] = 200
     num_workers: int = 0
     seed: int = 48
     device: Optional[str] = None
@@ -981,7 +990,11 @@ class ProbeEvalConfig:
 
 
 def build_probe_loaders(cfg: ProbeEvalConfig) -> Tuple[DataLoader, DataLoader]:
-    """Load the plot-status dataset and split it with stratification.
+    """Load the plot-status dataset, split it, and cap the training set.
+
+    The test split is fixed by ``cfg.test_ratio`` and ``cfg.seed``; the
+    training split is then reduced to ``cfg.max_train_images`` with the class
+    proportions preserved.
 
     Parameters
     ----------
@@ -997,9 +1010,14 @@ def build_probe_loaders(cfg: ProbeEvalConfig) -> Tuple[DataLoader, DataLoader]:
     """
     dataset = PlotStatusDataset(cfg.image_dir, cfg.annotation_path, cfg.label_mapping,
                                 build_eval_transform(cfg.image_size))
+    targets = np.asarray(dataset.targets)
     train_idx, test_idx = train_test_split(np.arange(len(dataset)), test_size=cfg.test_ratio,
-                                           stratify=dataset.targets, random_state=cfg.seed)
-    print(f"Probe split: {len(train_idx)} train | {len(test_idx)} test")
+                                           stratify=targets, random_state=cfg.seed)
+    available = len(train_idx)
+    if cfg.max_train_images is not None and available > cfg.max_train_images:
+        train_idx, _ = train_test_split(train_idx, train_size=cfg.max_train_images,
+                                        stratify=targets[train_idx], random_state=cfg.seed)
+    print(f"Probe split: {len(train_idx)} train (of {available} available) | {len(test_idx)} test")
     train_loader = DataLoader(Subset(dataset, train_idx), batch_size=cfg.batch_size, shuffle=True,
                               num_workers=cfg.num_workers)
     test_loader = DataLoader(Subset(dataset, test_idx), batch_size=cfg.batch_size, shuffle=False,
