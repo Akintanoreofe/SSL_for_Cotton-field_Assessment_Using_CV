@@ -123,6 +123,7 @@ def run_pretraining(cfg: PretrainConfig, pca_epochs: Optional[Iterable[int]] = N
     history : pandas.DataFrame
         Per-epoch loss components.
     """
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     plots_dir = cfg.output_dir / "plots"
     epochs_to_log = set(pca_epochs) if pca_epochs is not None else default_pca_epochs(cfg.epochs)
     callback = partial(log_pretraining_pca, epochs_to_log=epochs_to_log, out_dir=plots_dir / "pca_3d",
@@ -151,6 +152,7 @@ def run_detection_evaluation(cfg: DetectionEvalConfig, max_overlays: int = 20) -
     pandas.DataFrame
         One row per variant with precision, recall, mAP50 and mAP50-95.
     """
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     device = ultralytics_device(select_device(cfg.device))
     data_yaml = prepare_detection_split(cfg.source_dir, cfg.split_dir, cfg.class_names,
                                         cfg.val_ratio, cfg.subset_ratio, cfg.seed)
@@ -185,9 +187,9 @@ def run_probe_evaluation(cfg: ProbeEvalConfig) -> pd.DataFrame:
     pandas.DataFrame
         One row per variant with accuracy and macro F1.
     """
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     device = select_device(cfg.device)
     plots_dir = cfg.output_dir / "plots"
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     train_loader, test_loader = build_probe_loaders(cfg)
     rows, histories = [], {}
     for variant in cfg.variants:

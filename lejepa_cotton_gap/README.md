@@ -23,12 +23,27 @@ Each module has one job, and shared helpers are defined once and imported. For e
 
 ## Installation
 
+**From GitHub (works in a VS Code "GitHub remote repository" workspace):**
+
 ```bash
-cd lejepa_cotton_gap
-pip install -e .            # add [notebook] to also install Jupyter
+pip install --force-reinstall --no-deps "git+https://github.com/Akintanoreofe/SSL_for_Cotton-field_Assessment_Using_CV.git@Packaging#subdirectory=lejepa_cotton_gap"
 ```
 
+The first install needs the dependencies, so leave out `--no-deps` that time. `--force-reinstall` makes pip pick up new commits even though the version number is unchanged. Restart the Jupyter kernel afterwards.
+
+**From a local clone (recommended while developing):**
+
+```bash
+git clone -b Packaging https://github.com/Akintanoreofe/SSL_for_Cotton-field_Assessment_Using_CV.git
+cd SSL_for_Cotton-field_Assessment_Using_CV/lejepa_cotton_gap
+pip install -e . --config-settings editable_mode=compat
+```
+
+`editable_mode=compat` installs a plain path entry that VS Code/Pylance can follow, so hover docstrings and go-to-definition work.
+
 Python ≥ 3.9, PyTorch ≥ 2.0, torchvision ≥ 0.16, Ultralytics ≥ 8.1.
+
+**Paths:** use absolute paths in the notebook. A Jupyter kernel launched from a virtual workspace starts in `/`, which is read-only on macOS.
 
 ## Method
 
