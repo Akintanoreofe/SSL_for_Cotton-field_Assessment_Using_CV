@@ -23,8 +23,10 @@ No directory is hard coded; every path comes from the configuration objects.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,7 +38,7 @@ import torch
 import torch.nn as nn
 import yaml
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from torch.utils.data import DataLoader, Dataset, Subset
 from ultralytics import YOLO
 
@@ -208,12 +210,76 @@ def yolo_to_xyxy(labels: np.ndarray, width: int, height: int) -> np.ndarray:
     return np.stack([xc - w / 2, yc - h / 2, xc + w / 2, yc + h / 2], axis=1)
 
 
-def find_labeled_pairs(source_dir: Path) -> List[Tuple[Path, Path]]:
-    """Pair every image with a non-empty YOLO label file.
+def find_label_file(image_path: Path, unique_label_index: Dict[str, Path]) -> Optional[Path]:
+    """Locate the YOLO label file that belongs to an image.
 
-    Images are read from ``source_dir/images`` and labels from
-    ``source_dir/labels`` when those folders exist, otherwise both come from
-    ``source_dir`` itself.
+    Three layouts are recognised, in this order:
+
+    1. Ultralytics/Roboflow convention: the last ``images`` folder in the
+       image path is replaced by ``labels`` (e.g. ``014/images/a.jpg`` ->
+       ``014/labels/a.txt`` or ``train/images/a.jpg`` -> ``train/labels/a.txt``).
+    2. A ``.txt`` file next to the image with the same stem.
+    3. A ``.txt`` file with the same stem elsewhere in the dataset, used only
+       when that stem is unique so labels are never borrowed from another
+       sub-dataset.
+
+    Parameters
+    ----------
+    image_path : pathlib.Path
+        Image file.
+    unique_label_index : dict of str to pathlib.Path
+        Map from file stem to label path for ``.txt`` stems that occur once
+        in the dataset.
+
+    Returns
+    -------
+    pathlib.Path or None
+        The label file, or ``None`` if no candidate exists.
+    """
+    parts = image_path.parts
+    if "images" in parts:
+        cut = len(parts) - 1 - parts[::-1].index("images")
+        candidate = Path(*parts[:cut], "labels", *parts[cut + 1:]).with_suffix(".txt")
+        if candidate.exists():
+            return candidate
+    sibling = image_path.with_suffix(".txt")
+    if sibling.exists():
+        return sibling
+    return unique_label_index.get(image_path.stem)
+
+
+def file_digest(path: Path, chunk_size: int = 1 << 20) -> str:
+    """MD5 digest of a file's bytes, used to detect duplicate images.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        File to hash.
+    chunk_size : int, default=1048576
+        Bytes read per chunk.
+
+    Returns
+    -------
+    str
+        Hexadecimal digest.
+    """
+    digest = hashlib.md5()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def find_labeled_pairs(source_dir: Path) -> List[Tuple[Path, Path]]:
+    """Pair every unique image in a dataset with its non-empty YOLO label file.
+
+    The dataset is searched recursively, so a folder of sub-datasets (e.g.
+    ``014/images`` + ``014/labels``, ``ssl_active_1/images`` + ...), a single
+    ``images/`` + ``labels/`` folder, or a flat folder all work. Stray ``.txt``
+    files such as split lists (``014.txt``) are ignored because no image
+    matches them. Byte-identical images that appear in several sub-datasets
+    are kept once, so the same image can never land in both train and
+    validation.
 
     Parameters
     ----------
@@ -223,31 +289,70 @@ def find_labeled_pairs(source_dir: Path) -> List[Tuple[Path, Path]]:
     Returns
     -------
     list of tuple of pathlib.Path
-        ``(image_path, label_path)`` pairs.
+        ``(image_path, label_path)`` pairs, one per unique image.
 
     Raises
     ------
     RuntimeError
-        If no labelled image is found.
+        If no image has a non-empty label file; the message reports what was
+        found.
     """
     source_dir = Path(source_dir)
-    image_dir = source_dir / "images" if (source_dir / "images").exists() else source_dir
-    label_dir = source_dir / "labels" if (source_dir / "labels").exists() else source_dir
-    pairs = [(img, label_dir / f"{img.stem}.txt") for img in list_images(image_dir)]
-    pairs = [(img, lbl) for img, lbl in pairs if len(read_yolo_labels(lbl))]
-    if not pairs:
-        raise RuntimeError(f"No labelled images found in {source_dir}")
+    images = list_images(source_dir)
+    stems = Counter(path.stem for path in source_dir.rglob("*.txt"))
+    unique_index = {p.stem: p for p in source_dir.rglob("*.txt") if stems[p.stem] == 1}
+    matched = [(img, find_label_file(img, unique_index)) for img in images]
+    matched = [(img, lbl) for img, lbl in matched if lbl is not None]
+    labelled = [(img, lbl) for img, lbl in matched if len(read_yolo_labels(lbl))]
+    if not labelled:
+        raise RuntimeError(
+            f"No labelled images found in {source_dir}: {len(images)} images, "
+            f"{sum(stems.values())} .txt files, {len(matched)} images with a matching label file, "
+            f"{len(matched) - len(labelled)} of them empty. Labels must be YOLO text files (class xc yc w h) "
+            f"stored in a 'labels' folder next to the 'images' folder, or next to the image."
+        )
+    seen, pairs = set(), []
+    for img, lbl in labelled:
+        key = file_digest(img)
+        if key not in seen:
+            seen.add(key)
+            pairs.append((img, lbl))
+    print(f"Detection data: {len(images)} images | {len(labelled)} with boxes | "
+          f"{len(labelled) - len(pairs)} duplicates removed | {len(pairs)} unique labelled images.")
     return pairs
 
 
-def copy_pairs(pairs: Sequence[Tuple[Path, Path]], image_dir: Path, label_dir: Path,
+def unique_stem(image_path: Path, source_dir: Path) -> str:
+    """File stem that stays unique when images from sub-folders are merged.
+
+    Parameters
+    ----------
+    image_path : pathlib.Path
+        Image inside ``source_dir``.
+    source_dir : pathlib.Path
+        Dataset root.
+
+    Returns
+    -------
+    str
+        Relative folders (without ``images``) and the stem joined by ``__``,
+        e.g. ``014__IMG_0001`` for ``014/images/IMG_0001.jpg``.
+    """
+    relative = image_path.relative_to(source_dir)
+    folders = [part for part in relative.parts[:-1] if part != "images"]
+    return "__".join([*folders, relative.stem])
+
+
+def copy_pairs(pairs: Sequence[Tuple[Path, Path]], source_dir: Path, image_dir: Path, label_dir: Path,
                single_class: bool) -> None:
-    """Copy image/label pairs into a split folder.
+    """Copy image/label pairs into a split folder under collision-free names.
 
     Parameters
     ----------
     pairs : sequence of tuple of pathlib.Path
         ``(image_path, label_path)`` pairs.
+    source_dir : pathlib.Path
+        Dataset root, used to build unique names with :func:`unique_stem`.
     image_dir : pathlib.Path
         Destination image folder.
     label_dir : pathlib.Path
@@ -258,11 +363,67 @@ def copy_pairs(pairs: Sequence[Tuple[Path, Path]], image_dir: Path, label_dir: P
     image_dir.mkdir(parents=True, exist_ok=True)
     label_dir.mkdir(parents=True, exist_ok=True)
     for image_path, label_path in pairs:
-        shutil.copy2(image_path, image_dir / image_path.name)
+        stem = unique_stem(image_path, source_dir)
+        shutil.copy2(image_path, image_dir / f"{stem}{image_path.suffix.lower()}")
         labels = read_yolo_labels(label_path)
         if single_class:
             labels[:, 0] = 0
-        write_yolo_labels(labels, label_dir / f"{image_path.stem}.txt")
+        write_yolo_labels(labels, label_dir / f"{stem}.txt")
+
+
+def top_level_folder(image_path: Path, source_dir: Path) -> str:
+    """Name of the first folder below ``source_dir`` that contains an image.
+
+    Parameters
+    ----------
+    image_path : pathlib.Path
+        Image inside ``source_dir``.
+    source_dir : pathlib.Path
+        Dataset root.
+
+    Returns
+    -------
+    str
+        Top-level sub-folder name, or ``"."`` for images directly in the root.
+    """
+    relative = image_path.relative_to(source_dir)
+    return relative.parts[0] if len(relative.parts) > 1 else "."
+
+
+def split_pairs(pairs: List[Tuple[Path, Path]], source_dir: Path, val_ratio: float, seed: int,
+                split_by: str = "image") -> Tuple[list, list]:
+    """Split pairs into train and validation sets.
+
+    Parameters
+    ----------
+    pairs : list of tuple of pathlib.Path
+        ``(image_path, label_path)`` pairs.
+    source_dir : pathlib.Path
+        Dataset root.
+    val_ratio : float
+        Validation fraction (of images, or of folders when ``split_by="folder"``).
+    seed : int
+        Random seed.
+    split_by : {"image", "folder"}, default="image"
+        ``"image"`` splits images at random. ``"folder"`` keeps every
+        top-level sub-folder (sequence) entirely in train or in validation,
+        which prevents near-identical neighbouring frames from leaking across
+        the split.
+
+    Returns
+    -------
+    train_pairs, val_pairs : list
+        The two subsets.
+    """
+    if split_by == "image":
+        return train_test_split(pairs, test_size=val_ratio, random_state=seed)
+    if split_by != "folder":
+        raise ValueError("split_by must be 'image' or 'folder'.")
+    groups = [top_level_folder(img, source_dir) for img, _ in pairs]
+    splitter = GroupShuffleSplit(n_splits=1, test_size=val_ratio, random_state=seed)
+    train_idx, val_idx = next(splitter.split(pairs, groups=groups))
+    print("Validation folders:", sorted({groups[i] for i in val_idx}))
+    return [pairs[i] for i in train_idx], [pairs[i] for i in val_idx]
 
 
 def prepare_detection_split(
@@ -272,38 +433,44 @@ def prepare_detection_split(
     val_ratio: float = 0.2,
     subset_ratio: float = 1.0,
     seed: int = 42,
+    split_by: str = "image",
 ) -> Path:
     """Create a fresh train/val split and its Ultralytics ``dataset.yaml``.
 
     Parameters
     ----------
     source_dir : pathlib.Path
-        Labelled detection dataset.
+        Labelled detection dataset (any layout accepted by
+        :func:`find_labeled_pairs`).
     split_dir : pathlib.Path
         Output folder (deleted and recreated). Keep it outside ``source_dir``.
     class_names : sequence of str
         Class names; a single name forces every label to class ``0``.
     val_ratio : float, default=0.2
-        Fraction of pairs used for validation.
+        Validation fraction.
     subset_ratio : float, default=1.0
-        Fraction of all labelled pairs to keep.
+        Fraction of all unique labelled images to keep.
     seed : int, default=42
         Seed for subsetting and splitting.
+    split_by : {"image", "folder"}, default="image"
+        Split strategy, see :func:`split_pairs`.
 
     Returns
     -------
     pathlib.Path
         Path of the written ``dataset.yaml``.
     """
-    split_dir = Path(split_dir)
+    source_dir, split_dir = Path(source_dir), Path(split_dir)
+    if split_dir.resolve().is_relative_to(source_dir.resolve()):
+        raise ValueError("output_dir must be outside the detection dataset folder.")
     if split_dir.exists():
         shutil.rmtree(split_dir)
     pairs = find_labeled_pairs(source_dir)
     pairs = subsample(pairs, max(1, int(len(pairs) * subset_ratio)), seed)
-    train_pairs, val_pairs = train_test_split(pairs, test_size=val_ratio, random_state=seed)
+    train_pairs, val_pairs = split_pairs(pairs, source_dir, val_ratio, seed, split_by)
     single_class = len(class_names) == 1
     for name, subset in (("train", train_pairs), ("val", val_pairs)):
-        copy_pairs(subset, split_dir / "images" / name, split_dir / "labels" / name, single_class)
+        copy_pairs(subset, source_dir, split_dir / "images" / name, split_dir / "labels" / name, single_class)
     print(f"Detection split: {len(train_pairs)} train | {len(val_pairs)} val -> {split_dir}")
 
     yaml_path = split_dir / "dataset.yaml"
@@ -339,6 +506,9 @@ class DetectionEvalConfig:
         Validation fraction.
     subset_ratio : float, default=1.0
         Fraction of labelled images used.
+    split_by : {"image", "folder"}, default="image"
+        ``"image"`` splits images at random; ``"folder"`` keeps each top-level
+        sub-folder (sequence) wholly in train or validation.
     image_size : int, default=256
         Training and validation image size.
     batch_size : int, default=16
@@ -380,6 +550,7 @@ class DetectionEvalConfig:
     variants: Tuple[str, ...] = ("lejepa", "coco")
     val_ratio: float = 0.2
     subset_ratio: float = 1.0
+    split_by: str = "image"
     image_size: int = 256
     batch_size: int = 16
     epochs: int = 40
@@ -441,7 +612,45 @@ def detection_init_weights(variant: str, sources: WeightSources, export_dir: Pat
     if variant == "scratch":
         return str(sources.model_cfg)
     backbone = build_backbone_for_variant(variant, sources)
-    return str(export_backbone_to_yolo(backbone, Path(export_dir) / f"{variant}_init.pt", sources.model_cfg))
+    init_path = export_backbone_to_yolo(backbone, Path(export_dir) / f"{variant}_init.pt", sources.model_cfg)
+    max_diff = verify_backbone_transfer(init_path, backbone)
+    if max_diff != 0.0:
+        raise RuntimeError(f"Backbone transfer for '{variant}' failed: max |difference| = {max_diff:.3e}")
+    print(f"[{variant}] backbone layers 0-{len(backbone.layers) - 1} verified in {init_path}")
+    return str(init_path)
+
+
+def verify_backbone_transfer(init_weights: Path, backbone: YOLOv8MultiScaleBackbone) -> float:
+    """Measure how exactly a detector checkpoint reproduces a backbone.
+
+    Every tensor of ``backbone`` (weights, biases and BatchNorm statistics)
+    is compared with the matching tensor of the detector loaded from
+    ``init_weights``.
+
+    Parameters
+    ----------
+    init_weights : pathlib.Path
+        Ultralytics checkpoint written by
+        :func:`core_pretraining.export_backbone_to_yolo`.
+    backbone : YOLOv8MultiScaleBackbone
+        Backbone that should have been transferred.
+
+    Returns
+    -------
+    float
+        Largest absolute element-wise difference; ``0.0`` means an exact copy.
+
+    Raises
+    ------
+    KeyError
+        If the two state dictionaries do not have the same keys.
+    """
+    source = backbone.layers.state_dict()
+    detector = YOLO(str(init_weights)).model
+    target = nn.ModuleList(list(detector.model[: len(backbone.layers)])).state_dict()
+    if source.keys() != target.keys():
+        raise KeyError("Backbone and detector layer keys differ.")
+    return max(float((source[k].float().cpu() - target[k].float().cpu()).abs().max()) for k in source)
 
 
 def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConfig,
@@ -533,32 +742,136 @@ def load_training_log(run_dir: Path) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Linear probe: data
 # --------------------------------------------------------------------------- #
+ANNOTATION_NAME_KEYS = ("file_name", "filename", "image", "image_name", "name", "path")
+ANNOTATION_LABEL_KEYS = ("label", "status", "class", "category", "plot_status")
+
+
+def normalize_label(text: str) -> str:
+    """Canonical form of a class name for tolerant matching.
+
+    Parameters
+    ----------
+    text : str
+        Raw label such as ``"In Plot"`` or ``"between-plots"``.
+
+    Returns
+    -------
+    str
+        Lower-case label with spaces and hyphens replaced by underscores.
+    """
+    return str(text).strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def find_annotation_file(image_dir: Path) -> Path:
+    """Find the JSON annotation file inside a classification dataset folder.
+
+    Parameters
+    ----------
+    image_dir : pathlib.Path
+        Dataset folder.
+
+    Returns
+    -------
+    pathlib.Path
+        ``annotations.json`` if present, otherwise the only ``.json`` file.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no JSON file, or several without an ``annotations.json``, exist.
+    """
+    candidates = sorted(Path(image_dir).rglob("*.json"))
+    preferred = [p for p in candidates if p.name.lower() == "annotations.json"]
+    if preferred:
+        return preferred[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    raise FileNotFoundError(f"Expected one JSON annotation file in {image_dir}, found {len(candidates)}: "
+                            f"{[p.name for p in candidates]}. Set annotation_path explicitly.")
+
+
+def first_present(record: dict, keys: Sequence[str]) -> Optional[str]:
+    """Return the value of the first key of ``keys`` present in ``record``.
+
+    Parameters
+    ----------
+    record : dict
+        Annotation record.
+    keys : sequence of str
+        Candidate keys in priority order.
+
+    Returns
+    -------
+    str or None
+        The value, or ``None`` if no key is present.
+    """
+    return next((record[k] for k in keys if k in record), None)
+
+
+def load_label_annotations(annotation_path: Path) -> Dict[str, str]:
+    """Read image-level labels from a JSON file.
+
+    Supported shapes: ``{"img.jpg": "in_plot"}``, ``{"img.jpg": {"label":
+    "in_plot"}}`` and ``[{"file_name": "img.jpg", "label": "in_plot"}, ...]``
+    (see :data:`ANNOTATION_NAME_KEYS` and :data:`ANNOTATION_LABEL_KEYS`).
+
+    Parameters
+    ----------
+    annotation_path : pathlib.Path
+        JSON annotation file.
+
+    Returns
+    -------
+    dict of str to str
+        Image file name (without folders) to raw label.
+
+    Raises
+    ------
+    ValueError
+        If the JSON structure is not recognised.
+    """
+    data = json.loads(Path(annotation_path).read_text())
+    if isinstance(data, dict):
+        records = [(name, value if not isinstance(value, dict) else first_present(value, ANNOTATION_LABEL_KEYS))
+                   for name, value in data.items()]
+    elif isinstance(data, list) and all(isinstance(r, dict) for r in data):
+        records = [(first_present(r, ANNOTATION_NAME_KEYS), first_present(r, ANNOTATION_LABEL_KEYS)) for r in data]
+    else:
+        raise ValueError(f"Unrecognised annotation structure in {annotation_path}")
+    return {Path(str(name)).name: str(label) for name, label in records if name is not None and label is not None}
+
+
 class PlotStatusDataset(Dataset):
-    """Images labelled through a ``{file_name: label}`` JSON file.
+    """Images with one class label each, read from a JSON annotation file.
 
     Parameters
     ----------
     image_dir : pathlib.Path
         Folder searched recursively for images.
-    annotation_path : pathlib.Path
-        JSON mapping image file names to string labels.
+    annotation_path : pathlib.Path or None
+        JSON annotation file; ``None`` uses :func:`find_annotation_file`.
     label_mapping : dict of str to int
-        String label to class index.
+        Class name to class index (matched with :func:`normalize_label`).
     transform : callable
         Transform applied to each PIL image.
     """
 
-    def __init__(self, image_dir: Path, annotation_path: Path, label_mapping: Dict[str, int],
+    def __init__(self, image_dir: Path, annotation_path: Optional[Path], label_mapping: Dict[str, int],
                  transform) -> None:
-        annotations = json.loads(Path(annotation_path).read_text())
+        annotation_path = Path(annotation_path) if annotation_path else find_annotation_file(image_dir)
+        annotations = {name: normalize_label(label) for name, label in load_label_annotations(annotation_path).items()}
+        mapping = {normalize_label(name): index for name, index in label_mapping.items()}
+        images = list_images(image_dir)
         self.transform = transform
-        self.samples = [
-            (path, label_mapping[annotations[path.name]])
-            for path in list_images(image_dir)
-            if annotations.get(path.name) in label_mapping
-        ]
+        self.samples = [(path, mapping[annotations[path.name]]) for path in images
+                        if annotations.get(path.name) in mapping]
         if not self.samples:
-            raise RuntimeError(f"No annotated images found in {image_dir}")
+            raise RuntimeError(
+                f"No annotated images found: {len(images)} images in {image_dir}, {len(annotations)} "
+                f"annotations in {annotation_path.name}, labels found {sorted(set(annotations.values()))}, "
+                f"expected {sorted(mapping)}.")
+        print(f"Plot status data: {len(self.samples)} labelled images of {len(images)} "
+              f"(annotations: {annotation_path.name}), class counts {dict(Counter(self.targets))}.")
 
     @property
     def targets(self) -> List[int]:
@@ -601,13 +914,13 @@ class ProbeEvalConfig:
     Parameters
     ----------
     image_dir : str or pathlib.Path
-        Folder with plot-status images.
-    annotation_path : str or pathlib.Path
-        JSON file mapping image names to labels.
+        Folder with plot-status images (searched recursively).
     output_dir : str or pathlib.Path
         Folder for histories, metrics and plots.
     weights : WeightSources
         Initial-weight locations.
+    annotation_path : str, pathlib.Path or None, default=None
+        JSON annotation file; ``None`` finds it inside ``image_dir``.
     label_mapping : dict of str to int
         String label to class index.
     variants : tuple of str, default=("lejepa", "coco")
@@ -637,9 +950,9 @@ class ProbeEvalConfig:
     """
 
     image_dir: Path
-    annotation_path: Path
     output_dir: Path
     weights: WeightSources
+    annotation_path: Optional[Path] = None
     label_mapping: Dict[str, int] = field(
         default_factory=lambda: {"headland": 0, "between_plots": 1, "in_plot": 2})
     variants: Tuple[str, ...] = ("lejepa", "coco")
@@ -657,7 +970,7 @@ class ProbeEvalConfig:
 
     def __post_init__(self) -> None:
         self.image_dir = Path(self.image_dir)
-        self.annotation_path = Path(self.annotation_path)
+        self.annotation_path = Path(self.annotation_path) if self.annotation_path else None
         self.output_dir = Path(self.output_dir)
         self.variants = tuple(validate_variant(v) for v in self.variants)
 

@@ -23,8 +23,11 @@ from .core_evaluation import (
     WeightSources,
     build_backbone_for_variant,
     classification_summary,
+    PlotStatusDataset,
     extract_embeddings,
+    find_labeled_pairs,
     prepare_detection_split,
+    verify_backbone_transfer,
 )
 from .core_pretraining import (
     PretrainConfig,
@@ -59,7 +62,9 @@ __all__ = [
     "cross_camera_prediction_loss",
     "discover_camera_groups",
     "export_backbone_to_yolo",
+    "PlotStatusDataset",
     "extract_embeddings",
+    "find_labeled_pairs",
     "load_backbone",
     "load_encoder",
     "prepare_detection_split",
@@ -70,5 +75,6 @@ __all__ = [
     "run_probe_evaluation",
     "save_encoder",
     "select_device",
+    "verify_backbone_transfer",
     "__version__",
 ]

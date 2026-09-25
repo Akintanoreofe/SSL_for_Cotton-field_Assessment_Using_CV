@@ -116,6 +116,13 @@ outputs/
 
 ## Data expectations
 
-- **Pretraining:** a folder (searched recursively) of multi-camera JPEGs. Frames with the same `clip` and `frame` numbers are assumed to be captured at the same moment. Change `filename_pattern` if your naming differs; it must keep the named groups `clip`, `cam` and `frame`.
-- **Detection:** `images/` and `labels/` folders in YOLO format, where images with empty label files are skipped. Keep `output_dir` outside `source_dir`.
-- **Plot status:** images plus an `annotations.json` of the form `{"file_name.jpg": "in_plot", ...}`.
+- **Pretraining:** a folder (searched recursively) of multi-camera JPEGs named `clip<n>_cam<k>_frame<m>.jpg`. Images with the same `clip` and `frame` are assumed to be synchronised. Change `filename_pattern` if your naming differs; it must keep the named groups `clip`, `cam` and `frame`.
+- **Detection:** YOLO text labels (`class xc yc w h`). Any of these layouts works, searched recursively:
+  - a folder of sub-datasets, each with `images/` and `labels/` (e.g. `014/images`, `014/labels`, `ssl_active_1/...`);
+  - a single `images/` + `labels/` pair;
+  - labels next to their images.
+
+  Images without boxes are skipped. Byte-identical images that appear in several sub-datasets are kept once. Split files are renamed `<subfolder>__<name>` so equal file names from different sub-datasets never overwrite each other. Stray list files (`014.txt`) and `.yaml` files in the root are ignored. Set `split_by="folder"` to keep each sub-dataset wholly in train or validation. Keep `output_dir` outside the dataset folder.
+- **Plot status:** a folder with the images and a JSON annotation file, found automatically (`annotations.json` if present, otherwise the only `.json`). Accepted shapes: `{"img.jpg": "in_plot"}`, `{"img.jpg": {"label": "in_plot"}}`, or a list of `{"file_name": ..., "label": ...}` records. Labels are matched case-insensitively, with spaces or hyphens treated as underscores.
+
+Run `find_labeled_pairs(DETECTION_DATA)` and `PlotStatusDataset(PLOT_STATUS_DIR, None, label_mapping, transform=None)` to check both datasets in seconds before training.
