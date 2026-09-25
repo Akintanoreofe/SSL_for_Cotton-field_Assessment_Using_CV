@@ -21,6 +21,7 @@ from .core_evaluation import (
     build_probe_loaders,
     classification_summary,
     detection_init_weights,
+    coco_state_dict,
     extract_embeddings,
     finetune_detector,
     fit_probe_variant,
@@ -150,18 +151,23 @@ def run_detection_evaluation(cfg: DetectionEvalConfig, max_overlays: int = 20) -
     Returns
     -------
     pandas.DataFrame
-        One row per variant with precision, recall, mAP50 and mAP50-95.
+        One row per variant with precision, recall, mAP50 and mAP50-95, plus
+        the share of backbone, neck and head tensors identical to COCO at the
+        start of training (``coco_share_*``).
     """
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     device = ultralytics_device(select_device(cfg.device))
     data_yaml = prepare_detection_split(cfg.source_dir, cfg.split_dir, cfg.class_names,
                                         cfg.val_ratio, cfg.max_train_images, cfg.seed, cfg.split_by)
     rows, run_dirs = [], {}
+    coco_state = coco_state_dict(cfg.weights)
     for variant in cfg.variants:
         init_weights = detection_init_weights(variant, cfg.weights, cfg.init_dir)
-        run_dirs[variant] = finetune_detector(init_weights, data_yaml, cfg, variant, device)
+        run_dirs[variant], init_report = finetune_detector(init_weights, data_yaml, cfg, variant, device,
+                                                           coco_state)
         best = run_dirs[variant] / "weights" / "best.pt"
-        rows.append({"variant": variant, **validate_detector(best, data_yaml, cfg, variant, device)})
+        rows.append({"variant": variant, **validate_detector(best, data_yaml, cfg, variant, device),
+                     **init_report})
         save_detection_overlays(best, cfg.split_dir / "images" / "val", cfg.split_dir / "labels" / "val",
                                 cfg.output_dir / "overlays" / variant, cfg.image_size, cfg.conf, device,
                                 max_overlays)

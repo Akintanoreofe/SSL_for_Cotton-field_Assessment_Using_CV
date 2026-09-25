@@ -28,6 +28,7 @@ import json
 import shutil
 from collections import Counter
 from copy import deepcopy
+from functools import partial
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -504,8 +505,10 @@ class DetectionEvalConfig:
         Initial-weight locations.
     class_names : tuple of str, default=("cotton_boll",)
         Detection classes.
-    variants : tuple of str, default=("lejepa", "coco")
-        Variants to fine-tune and compare.
+    variants : tuple of str, default=("lejepa", "coco_backbone")
+        Variants to fine-tune and compare. The default pair differs only in
+        the backbone (neck and head start from random weights in both); add
+        ``"coco"`` for the fully COCO-pretrained reference.
     val_ratio : float, default=0.2
         Validation fraction.
     max_train_images : int or None, default=200
@@ -552,7 +555,7 @@ class DetectionEvalConfig:
     output_dir: Path
     weights: WeightSources
     class_names: Tuple[str, ...] = ("cotton_boll",)
-    variants: Tuple[str, ...] = ("lejepa", "coco")
+    variants: Tuple[str, ...] = ("lejepa", "coco_backbone")
     val_ratio: float = 0.2
     max_train_images: Optional[int] = 200
     split_by: str = "image"
@@ -658,9 +661,150 @@ def verify_backbone_transfer(init_weights: Path, backbone: YOLOv8MultiScaleBackb
     return max(float((source[k].float().cpu() - target[k].float().cpu()).abs().max()) for k in source)
 
 
+DETECTOR_PARTS = ("backbone", "neck", "head")
+EXPECTED_COCO_SHARE = {
+    "lejepa": {"backbone": 0.0, "neck": 0.0, "head": 0.0},
+    "scratch": {"backbone": 0.0, "neck": 0.0, "head": 0.0},
+    "coco_backbone": {"backbone": 1.0, "neck": 0.0, "head": 0.0},
+}
+
+
+def coco_state_dict(sources: WeightSources) -> Dict[str, torch.Tensor]:
+    """Load the COCO ``DetectionModel`` weights used as the audit reference.
+
+    Parameters
+    ----------
+    sources : WeightSources
+        Weight locations; ``sources.coco_weights`` is loaded.
+
+    Returns
+    -------
+    dict of str to torch.Tensor
+        CPU copy of the COCO detector state dictionary.
+    """
+    return {k: v.detach().cpu().clone() for k, v in YOLO(str(sources.coco_weights)).model.state_dict().items()}
+
+
+def detector_part(layer_index: int, num_layers: int, backbone_layers: int = 10) -> str:
+    """Name the detector part that a layer index belongs to.
+
+    Parameters
+    ----------
+    layer_index : int
+        Index of the layer in ``DetectionModel.model``.
+    num_layers : int
+        Total number of layers; the last one is the Detect head.
+    backbone_layers : int, default=10
+        Number of leading backbone layers.
+
+    Returns
+    -------
+    str
+        ``"backbone"``, ``"neck"`` or ``"head"``.
+    """
+    if layer_index < backbone_layers:
+        return "backbone"
+    return "head" if layer_index == num_layers - 1 else "neck"
+
+
+def coco_share_by_part(model: nn.Module, coco_state: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    """Fraction of trainable tensors in each detector part identical to COCO.
+
+    Only trainable parameters with the same name and shape in both models are
+    compared. Fixed buffers and the non-trainable DFL projection (identical in
+    every YOLOv8 model by construction) are ignored, as are head tensors whose
+    shape changed because the number of classes differs.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Ultralytics ``DetectionModel`` to inspect.
+    coco_state : dict of str to torch.Tensor
+        State dictionary of the COCO ``DetectionModel``.
+
+    Returns
+    -------
+    dict of str to float
+        Share of compared tensors equal to COCO, per part (``nan`` if none).
+    """
+    num_layers = len(model.model)
+    equal = {part: 0 for part in DETECTOR_PARTS}
+    total = {part: 0 for part in DETECTOR_PARTS}
+    for name, param in model.named_parameters():
+        reference = coco_state.get(name)
+        if ".dfl." in name or reference is None or reference.shape != param.shape:
+            continue
+        part = detector_part(int(name.split(".")[1]), num_layers)
+        total[part] += 1
+        equal[part] += int(torch.equal(param.detach().float().cpu(), reference.float().cpu()))
+    return {part: equal[part] / total[part] if total[part] else float("nan") for part in DETECTOR_PARTS}
+
+
+def check_initialisation(variant: str, shares: Dict[str, float]) -> None:
+    """Fail if a variant does not start from the weights it claims to.
+
+    Parameters
+    ----------
+    variant : str
+        One of :data:`VARIANTS`.
+    shares : dict of str to float
+        Output of :func:`coco_share_by_part`.
+
+    Raises
+    ------
+    RuntimeError
+        If, for example, the neck or head of ``"lejepa"`` or
+        ``"coco_backbone"`` contains COCO weights.
+    """
+    expected = EXPECTED_COCO_SHARE.get(variant)
+    if expected is None:
+        return
+    wrong = {part: shares[part] for part, value in expected.items() if shares[part] != value}
+    if wrong:
+        raise RuntimeError(f"Variant '{variant}' starts from unexpected weights: share identical to "
+                           f"COCO {wrong}, expected {expected}.")
+
+
+def record_initialisation(trainer, *, variant: str, coco_state: Dict[str, torch.Tensor],
+                          report: Dict[str, float]) -> None:
+    """Ultralytics ``on_train_start`` callback that audits the model being trained.
+
+    It inspects ``trainer.model`` - the network Ultralytics actually
+    optimises - so any weight loading done inside Ultralytics is caught.
+
+    Parameters
+    ----------
+    trainer : ultralytics.engine.trainer.BaseTrainer
+        Trainer passed by Ultralytics.
+    variant : str
+        Variant being trained.
+    coco_state : dict of str to torch.Tensor
+        State dictionary of the COCO ``DetectionModel``.
+    report : dict
+        Filled in place with ``coco_share_<part>`` entries.
+
+    Raises
+    ------
+    RuntimeError
+        Propagated from :func:`check_initialisation`, stopping training.
+    """
+    model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+    shares = coco_share_by_part(model, coco_state)
+    report.update({f"coco_share_{part}": value for part, value in shares.items()})
+    print(f"[{variant}] share of tensors identical to COCO: "
+          + ", ".join(f"{part}={value:.2f}" for part, value in shares.items()))
+    check_initialisation(variant, shares)
+
+
 def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConfig,
-                      run_name: str, device: str) -> Path:
-    """Fine-tune a YOLOv8 detector.
+                      run_name: str, device: str,
+                      coco_state: Optional[Dict[str, torch.Tensor]] = None) -> Tuple[Path, Dict[str, float]]:
+    """Fine-tune a YOLOv8 detector, auditing its starting weights.
+
+    When ``coco_state`` is given, the model Ultralytics trains is compared
+    with COCO at the start of training (:func:`record_initialisation`), and
+    training stops if the neck or head of a backbone-only variant is not
+    random.
 
     Parameters
     ----------
@@ -674,13 +818,21 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
         Run folder name inside ``cfg.runs_dir``.
     device : str
         Ultralytics device string.
+    coco_state : dict of str to torch.Tensor or None, default=None
+        COCO ``DetectionModel`` state dictionary used for the audit.
 
     Returns
     -------
-    pathlib.Path
+    run_dir : pathlib.Path
         The run folder (contains ``weights/best.pt`` and ``results.csv``).
+    init_report : dict of str to float
+        Share of tensors identical to COCO per part (empty without audit).
     """
     model = YOLO(init_weights)
+    init_report: Dict[str, float] = {}
+    if coco_state is not None:
+        model.add_callback("on_train_start", partial(record_initialisation, variant=run_name,
+                                                     coco_state=coco_state, report=init_report))
     model.train(
         data=str(data_yaml), epochs=cfg.epochs, imgsz=cfg.image_size, batch=cfg.batch_size,
         device=device, optimizer=cfg.optimizer, lr0=cfg.lr0, lrf=cfg.lrf,
@@ -689,7 +841,7 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
         project=str(cfg.runs_dir), name=run_name, exist_ok=True, plots=True, val=True,
         **cfg.train_overrides,
     )
-    return Path(model.trainer.save_dir)
+    return Path(model.trainer.save_dir), init_report
 
 
 def validate_detector(weights: Path, data_yaml: Path, cfg: DetectionEvalConfig,
