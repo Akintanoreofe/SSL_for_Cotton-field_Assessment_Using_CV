@@ -10,8 +10,6 @@ This module owns everything needed to *learn* a representation:
 * the training loop, checkpoint I/O and export of the backbone into an
   Ultralytics detection checkpoint.
 
-No directory is hard coded: every path is supplied by the caller through
-:class:`PretrainConfig` or through function arguments.
 """
 
 from __future__ import annotations
