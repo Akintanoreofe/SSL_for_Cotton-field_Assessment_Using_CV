@@ -2,6 +2,8 @@
 
 Cross-camera **LeJEPA** self-supervised pretraining of a **YOLOv8n** backbone with **global average pooling (GAP)**, evaluated against **COCO** weights on cotton-boll detection and plot-status classification.
 
+For a short repository overview and quick start, see the [root README](../README.md).
+
 ## Repository layout
 
 ```
@@ -26,20 +28,18 @@ Each module has one job, and shared helpers are defined once and imported. For e
 **From GitHub (works in a VS Code "GitHub remote repository" workspace):**
 
 ```bash
-pip install --force-reinstall --no-deps "git+https://github.com/Akintanoreofe/SSL_for_Cotton-field_Assessment_Using_CV.git@Packaging#subdirectory=lejepa_cotton_gap"
+python -m pip install "git+https://github.com/Akintanoreofe/SSL_for_Cotton-field_Assessment_Using_CV.git#subdirectory=lejepa_cotton_gap"
 ```
 
-The first install needs the dependencies, so leave out `--no-deps` that time. `--force-reinstall` makes pip pick up new commits even though the version number is unchanged. Restart the Jupyter kernel afterwards.
+Restart the Jupyter kernel after installing or updating the package.
 
 **From a local clone (recommended while developing):**
 
 ```bash
-git clone -b Packaging https://github.com/Akintanoreofe/SSL_for_Cotton-field_Assessment_Using_CV.git
+git clone https://github.com/Akintanoreofe/SSL_for_Cotton-field_Assessment_Using_CV.git
 cd SSL_for_Cotton-field_Assessment_Using_CV/lejepa_cotton_gap
-pip install -e . --config-settings editable_mode=compat
+python -m pip install -e .
 ```
-
-`editable_mode=compat` installs a plain path entry that VS Code/Pylance can follow, so hover docstrings and go-to-definition work.
 
 Python ≥ 3.9, PyTorch ≥ 2.0, torchvision ≥ 0.16, Ultralytics ≥ 8.1.
 
