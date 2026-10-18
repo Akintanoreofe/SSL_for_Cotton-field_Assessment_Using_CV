@@ -935,17 +935,35 @@ class SIGReg(nn.Module):
         # tests along random unit directions (the Cramer-Wold idea).
         directions = torch.randn(dim, self.num_slices, device=proj.device)
         directions = directions / (directions.norm(dim=0, keepdim=True) + 1e-12)  # unit length, (D, S)
-        # Project every embedding on every direction -> (V, N, S), then evaluate
-        # at each integration knot t -> (V, N, S, K).
+        # A projection onto a unit direction turns each D-dimensional embedding
+        # into one scalar. Repeating this for S directions gives many cheap
+        # one-dimensional tests instead of estimating a D-dimensional density.
+        # The Cramer-Wold principle says that matching all one-dimensional
+        # projections is sufficient to identify the full distribution.
+        #
+        # Shape bookkeeping:
+        #   proj @ directions:                  (V, N, S)
+        #   multiply by every integration knot: (V, N, S, K)
+        # Here V is the view, N the batch/sample count, S the random slice, and
+        # K the number of points used to numerically integrate over t.
         x_t = (proj @ directions).unsqueeze(-1) * self.t
-        # Empirical characteristic function over the N samples is
-        # E[cos(t x)] + i E[sin(t x)]. The N(0, 1) one is exp(-t^2/2) (real).
-        # err = (Re part - target)^2 + (Im part - 0)^2: squared distance
-        # between the two characteristic functions at each knot.
+        # A distribution's characteristic function is E[exp(i*t*x)]. Its
+        # empirical real and imaginary parts are respectively mean(cos(t*x))
+        # and mean(sin(t*x)) over the N samples. For a standard normal, the
+        # characteristic function is exp(-t^2/2), with zero imaginary part.
+        #
+        # Thus `err` is the squared complex distance between the observed and
+        # standard-normal characteristic functions at every view, slice, and
+        # knot: (observed_real - target_real)^2 + (observed_imag - 0)^2.
+        # Averaging over samples here is what makes this a distribution-level
+        # test rather than a pointwise penalty on each embedding.
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
-        # Integrate err over t with trapezoid weights times the Gaussian window
-        # (self.weights), scale by N as in the Epps-Pulley statistic, and
-        # average over views and slices to get one scalar.
+        # Numerically integrate the characteristic-function discrepancy over
+        # t. `self.weights` contains trapezoidal integration weights multiplied
+        # by the Gaussian window, which gives more emphasis to the central
+        # region. The Epps-Pulley statistic scales the integral by N; averaging
+        # the resulting values across views and random slices gives one scalar
+        # regularisation loss for this batch.
         return ((err @ self.weights) * n_samples).mean()
 
 
@@ -977,14 +995,22 @@ def cross_camera_prediction_loss(z: torch.Tensor, num_cameras: int) -> torch.Ten
     batch, num_views, dim = z.shape
     if num_cameras < 2 or num_views % num_cameras:
         raise ValueError(f"{num_views} views cannot be split across {num_cameras} cameras.")
-    # Views are camera-major: (B, V, D) -> (B, C, views_per_camera, D).
+    # The loader stacks camera 0's augmentations, then camera 1's, and so on.
+    # Restore that organization so the camera and augmentation axes are
+    # explicit: (B, V, D) -> (B, C, views_per_camera, D).
     per_camera = z.reshape(batch, num_cameras, num_views // num_cameras, dim)
-    # Mean embedding of each camera, (B, C, D).
+    # Collapse only the augmentation axis. Each frame now has one representative
+    # embedding per camera, shape (B, C, D).
     camera_means = per_camera.mean(dim=2)
-    # Target of camera c = mean of the other C-1 camera means:
-    # (sum over all cameras - own mean) / (C - 1).
+    # For camera c, form its target from the *other* cameras rather than
+    # including its own embedding. Subtracting its mean from the sum avoids
+    # constructing a separate masked tensor for every camera:
+    #   target_c = (sum_j camera_mean_j - camera_mean_c) / (C - 1)
+    # The resulting shape is (B, C, D), with one cross-view target per camera.
     other_means = (camera_means.sum(dim=1, keepdim=True) - camera_means) / (num_cameras - 1)
-    # Squared error between each view and the other cameras' mean.
+    # Compare every augmented view to its camera's other-camera target. The
+    # mean squares average equally over frames, cameras, augmentations, and
+    # embedding dimensions; gradients flow through both views and targets.
     return (per_camera - other_means.unsqueeze(2)).square().mean()
 
 
@@ -1013,7 +1039,10 @@ def intra_image_prediction_loss(z: torch.Tensor) -> torch.Tensor:
     """
     if z.dim() != 3 or z.shape[1] != 2:
         raise ValueError(f"intra-image loss needs shape (B, 2, D), got {tuple(z.shape)}.")
-    # View 0 predicts view 1 (and vice versa); the MSE is symmetric.
+    # The two entries are the independently augmented versions of one image.
+    # Their squared distance is symmetric, so one MSE compares both directions
+    # (view 0 as predictor of view 1 and view 1 as predictor of view 0). Averaging
+    # over the batch and embedding dimensions returns one scalar.
     return (z[:, 0] - z[:, 1]).square().mean()
 
 
@@ -1077,19 +1106,30 @@ def lejepa_loss(
     """
     logs: Dict[str, torch.Tensor] = {}
     for name, z in projections.items():
-        # Prediction term: agreement between views. Cross-camera: each camera
-        # predicts the mean of the others. Intra-image: the two geometric views
-        # of one image predict each other.
+        # Each backbone scale has its own projected embeddings z with shape
+        # (batch, views, projection_dim). Its selected prediction objective
+        # encourages agreement across cameras or between two transforms of one
+        # image, depending on `pred_loss_mode`.
         logs[f"pred_{name}"] = prediction_loss(z, pred_loss_mode, num_cameras)
-        # SIGReg term: same for both modes. z is (B, V, D); SIGReg expects
-        # (V, B, D) so each view's batch of embeddings is tested separately.
+        # SIGReg is independent of the prediction mode. Put views first because
+        # SIGReg interprets its leading axis as separate view groups and tests
+        # each group's batch distribution against N(0, I): (B, V, D) -> (V, B, D).
         logs[f"sigreg_{name}"] = sigreg(z.transpose(0, 1))
-    pred = torch.stack([logs[f"pred_{n}"] for n in projections]).mean()  # mean over scales P3/P4/P5
+    # The loss is computed independently at P3, P4, and P5. Average those scalar
+    # terms so no feature scale is selected in advance or counted more heavily
+    # merely because its feature map has a different spatial resolution.
+    pred = torch.stack([logs[f"pred_{n}"] for n in projections]).mean()
     sig = torch.stack([logs[f"sigreg_{n}"] for n in projections]).mean()
-    # lambda trades the two terms off: lam -> 0 emphasises view agreement (risk
-    # of collapse), lam -> 1 emphasises a Gaussian-spread embedding.
+    # Lambda is the SIGReg weight, not the prediction weight:
+    #   lam = 0: only view agreement is optimized (which alone can collapse);
+    #   lam = 1: only Gaussian-distribution regularisation is optimized;
+    # intermediate values trade agreement against a spread, non-collapsed
+    # embedding. Both components have already been averaged over scales.
     loss = (1.0 - lam) * pred + lam * sig
     logs.update(total=loss, pred=pred, sigreg=sig)
+    # Keep the training loss attached to autograd, but detach every value saved
+    # for reporting so epoch-history accumulation does not retain computation
+    # graphs or GPU activations.
     return loss, {k: v.detach() for k, v in logs.items()}
 
 

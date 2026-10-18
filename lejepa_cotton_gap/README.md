@@ -57,6 +57,10 @@ Python ≥ 3.9, PyTorch ≥ 2.0, torchvision ≥ 0.16, Ultralytics ≥ 8.1.
 - *SIGReg*: a sliced Epps–Pulley test pushes the embedding distribution toward an isotropic Gaussian, which prevents collapse.
 - `loss = (1 − λ)·prediction + λ·SIGReg`, with λ = 0.2 by default.
 
+**How the losses are computed.** At each feature scale, the projector produces embeddings with shape `(batch, views, projection_dim)`. With `cross_camera`, views are grouped by camera; each camera's target is the mean embedding of the *other* cameras in the same frame, and the prediction term is the mean squared error from every view to its camera's target. With `intra_image`, the two independently flipped/rotated views of each image are compared directly with mean squared error. Both prediction losses encourage agreement, but across different sources of views.
+
+SIGReg evaluates the embedding distribution separately for each view. It projects the batch onto many random unit directions, compares the empirical characteristic function on those one-dimensional projections with the characteristic function of a standard normal, and integrates the squared discrepancy over a fixed range. This sliced test encourages embeddings to have a spread, isotropic distribution instead of all collapsing to the same value. Prediction and SIGReg are each averaged across P3/P4/P5 before they are combined by λ. The reported component losses are detached from autograd; the combined training loss remains differentiable.
+
 **Export.** `export_backbone_to_yolo` writes a real Ultralytics `.pt` checkpoint whose layers 0–9 are the pretrained backbone. This step matters. `YOLO("yolov8n.yaml").train()` rebuilds the network from scratch, so weights copied into a YAML-built model in memory are silently discarded.
 
 ## Evaluation variants
