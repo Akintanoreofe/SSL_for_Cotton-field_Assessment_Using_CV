@@ -21,9 +21,9 @@ if __name__ == "__main__":
         output_dir=OUTPUT_ROOT / "pretraining",
         cameras=(1, 2, 4),          # 2nd, 3rd and 5th physical cameras (0-indexed)
         max_samples=16_667,         # synchronised triplets -> ~50k images
-        image_size=128,
+        image_size=640,
         batch_size=16,
-        epochs=60,
+        epochs=100,
         lam=0.2,
     )
     weights = WeightSources(lejepa_checkpoint=pretrain_cfg.checkpoint_path)
@@ -33,6 +33,7 @@ if __name__ == "__main__":
         output_dir=OUTPUT_ROOT / "detection",
         weights=weights,
         variants=("lejepa", "coco"),
+        image_size=640,
         epochs=40,
         device="cpu",
     )
