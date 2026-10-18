@@ -52,6 +52,7 @@ from .core_pretraining import (
     load_backbone,
     load_rgb,
     select_device,
+    validate_image_size,
     subsample,
 )
 
@@ -517,8 +518,9 @@ class DetectionEvalConfig:
     split_by : {"image", "folder"}, default="image"
         ``"image"`` splits images at random; ``"folder"`` keeps each top-level
         sub-folder (sequence) wholly in train or validation.
-    image_size : int, default=256
-        Training and validation image size.
+    image_size : int, default=640
+        Training and validation image size (multiple of 32). Use the same
+        value as the pretraining ``image_size``.
     batch_size : int, default=16
         Batch size.
     epochs : int, default=40
@@ -559,7 +561,7 @@ class DetectionEvalConfig:
     val_ratio: float = 0.2
     max_train_images: Optional[int] = 200
     split_by: str = "image"
-    image_size: int = 256
+    image_size: int = 640
     batch_size: int = 16
     epochs: int = 40
     optimizer: str = "AdamW"
@@ -580,6 +582,7 @@ class DetectionEvalConfig:
         self.source_dir = Path(self.source_dir)
         self.output_dir = Path(self.output_dir)
         self.variants = tuple(validate_variant(v) for v in self.variants)
+        validate_image_size(self.image_size)
 
     @property
     def split_dir(self) -> Path:
@@ -596,8 +599,14 @@ class DetectionEvalConfig:
         """pathlib.Path : Folder of exported initial checkpoints."""
         return self.output_dir / "init_weights"
 
+    @property
+    def eval_dir(self) -> Path:
+        """pathlib.Path : Folder of per-model predicted-vs-truth box files."""
+        return self.output_dir / "eval"
 
-def detection_init_weights(variant: str, sources: WeightSources, export_dir: Path) -> str:
+
+def detection_init_weights(variant: str, sources: WeightSources, export_dir: Path,
+                           name: Optional[str] = None) -> str:
     """Return the weights ``YOLO(...)`` should start from for a variant.
 
     Parameters
@@ -608,6 +617,9 @@ def detection_init_weights(variant: str, sources: WeightSources, export_dir: Pat
         Weight locations.
     export_dir : pathlib.Path
         Folder where backbone-only checkpoints are written.
+    name : str or None, default=None
+        File-name stem of the exported checkpoint; defaults to ``variant``.
+        Distinct names let several checkpoints of one variant coexist.
 
     Returns
     -------
@@ -620,11 +632,11 @@ def detection_init_weights(variant: str, sources: WeightSources, export_dir: Pat
     if variant == "scratch":
         return str(sources.model_cfg)
     backbone = build_backbone_for_variant(variant, sources)
-    init_path = export_backbone_to_yolo(backbone, Path(export_dir) / f"{variant}_init.pt", sources.model_cfg)
+    init_path = export_backbone_to_yolo(backbone, Path(export_dir) / f"{name or variant}_init.pt", sources.model_cfg)
     max_diff = verify_backbone_transfer(init_path, backbone)
     if max_diff != 0.0:
         raise RuntimeError(f"Backbone transfer for '{variant}' failed: max |difference| = {max_diff:.3e}")
-    print(f"[{variant}] backbone layers 0-{len(backbone.layers) - 1} verified in {init_path}")
+    print(f"[{name or variant}] backbone layers 0-{len(backbone.layers) - 1} verified in {init_path}")
     return str(init_path)
 
 
@@ -798,7 +810,8 @@ def record_initialisation(trainer, *, variant: str, coco_state: Dict[str, torch.
 
 def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConfig,
                       run_name: str, device: str,
-                      coco_state: Optional[Dict[str, torch.Tensor]] = None) -> Tuple[Path, Dict[str, float]]:
+                      coco_state: Optional[Dict[str, torch.Tensor]] = None,
+                      audit_variant: Optional[str] = None) -> Tuple[Path, Dict[str, float]]:
     """Fine-tune a YOLOv8 detector, auditing its starting weights.
 
     When ``coco_state`` is given, the model Ultralytics trains is compared
@@ -820,6 +833,9 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
         Ultralytics device string.
     coco_state : dict of str to torch.Tensor or None, default=None
         COCO ``DetectionModel`` state dictionary used for the audit.
+    audit_variant : str or None, default=None
+        Variant whose expected initialisation is checked; defaults to
+        ``run_name``.
 
     Returns
     -------
@@ -831,7 +847,7 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
     model = YOLO(init_weights)
     init_report: Dict[str, float] = {}
     if coco_state is not None:
-        model.add_callback("on_train_start", partial(record_initialisation, variant=run_name,
+        model.add_callback("on_train_start", partial(record_initialisation, variant=audit_variant or run_name,
                                                      coco_state=coco_state, report=init_report))
     model.train(
         data=str(data_yaml), epochs=cfg.epochs, imgsz=cfg.image_size, batch=cfg.batch_size,
@@ -876,6 +892,136 @@ def validate_detector(weights: Path, data_yaml: Path, cfg: DetectionEvalConfig,
     box = metrics.box
     return {"precision": float(box.mp), "recall": float(box.mr),
             "mAP50": float(box.map50), "mAP50-95": float(box.map)}
+
+
+BOX_COLUMNS = ("image_id", "status", "class", "confidence", "iou",
+               "gt_x1", "gt_y1", "gt_x2", "gt_y2", "pred_x1", "pred_y1", "pred_x2", "pred_y2")
+
+
+def pairwise_iou(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
+    """Intersection over union of every pair of boxes.
+
+    Parameters
+    ----------
+    boxes_a : numpy.ndarray
+        Shape ``(n, 4)`` rows of ``x1 y1 x2 y2``.
+    boxes_b : numpy.ndarray
+        Shape ``(m, 4)`` rows of ``x1 y1 x2 y2``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(n, m)`` IoU matrix.
+    """
+    top_left = np.maximum(boxes_a[:, None, :2], boxes_b[None, :, :2])
+    bottom_right = np.minimum(boxes_a[:, None, 2:], boxes_b[None, :, 2:])
+    inter = np.clip(bottom_right - top_left, 0, None).prod(axis=2)
+    area_a = (boxes_a[:, 2:] - boxes_a[:, :2]).prod(axis=1)
+    area_b = (boxes_b[:, 2:] - boxes_b[:, :2]).prod(axis=1)
+    union = area_a[:, None] + area_b[None, :] - inter
+    return np.divide(inter, union, out=np.zeros_like(inter, dtype=float), where=union > 0)
+
+
+def match_boxes(gt_boxes: np.ndarray, gt_classes: np.ndarray, pred_boxes: np.ndarray,
+                pred_classes: np.ndarray, scores: np.ndarray,
+                iou_threshold: float = 0.5) -> List[dict]:
+    """Greedily match predictions to ground truth, highest confidence first.
+
+    A prediction matches the unmatched same-class ground-truth box of highest
+    IoU if that IoU reaches ``iou_threshold``.
+
+    Parameters
+    ----------
+    gt_boxes : numpy.ndarray
+        Shape ``(g, 4)`` pixel ``x1 y1 x2 y2``.
+    gt_classes : numpy.ndarray
+        Shape ``(g,)`` class ids.
+    pred_boxes : numpy.ndarray
+        Shape ``(p, 4)`` pixel ``x1 y1 x2 y2``.
+    pred_classes : numpy.ndarray
+        Shape ``(p,)`` class ids.
+    scores : numpy.ndarray
+        Shape ``(p,)`` confidences.
+    iou_threshold : float, default=0.5
+        Minimum IoU of a match.
+
+    Returns
+    -------
+    list of dict
+        One record per matched pair (``TP``), unmatched prediction (``FP``)
+        or unmatched ground truth (``FN``); keys are :data:`BOX_COLUMNS`
+        without ``image_id``.
+    """
+    ious = pairwise_iou(gt_boxes, pred_boxes) if len(gt_boxes) and len(pred_boxes) else np.zeros((len(gt_boxes), len(pred_boxes)))
+    taken, records = set(), []
+    for p in np.argsort(-scores):
+        candidates = [(ious[g, p], g) for g in range(len(gt_boxes))
+                      if g not in taken and gt_classes[g] == pred_classes[p]]
+        best_iou, best_gt = max(candidates, default=(0.0, None))
+        pred = dict(zip(("pred_x1", "pred_y1", "pred_x2", "pred_y2"), map(float, pred_boxes[p])))
+        if best_gt is not None and best_iou >= iou_threshold:
+            taken.add(best_gt)
+            gt = dict(zip(("gt_x1", "gt_y1", "gt_x2", "gt_y2"), map(float, gt_boxes[best_gt])))
+            records.append({"status": "TP", "class": int(pred_classes[p]), "confidence": float(scores[p]),
+                            "iou": float(best_iou), **gt, **pred})
+        else:
+            records.append({"status": "FP", "class": int(pred_classes[p]), "confidence": float(scores[p]),
+                            "iou": np.nan, **pred})
+    for g in range(len(gt_boxes)):
+        if g not in taken:
+            records.append({"status": "FN", "class": int(gt_classes[g]), "confidence": np.nan, "iou": np.nan,
+                            **dict(zip(("gt_x1", "gt_y1", "gt_x2", "gt_y2"), map(float, gt_boxes[g])))})
+    return records
+
+
+def save_box_predictions(weights: Path, image_dir: Path, label_dir: Path, out_path: Path, image_size: int,
+                         conf: float, device: str, iou_threshold: float = 0.5) -> Path:
+    """Save predicted and ground-truth boxes of every image of a split.
+
+    Images with neither boxes nor predictions get one row with status
+    ``"EMPTY"`` so every image id appears in the file.
+
+    Parameters
+    ----------
+    weights : pathlib.Path
+        Trained detector (``best.pt``).
+    image_dir : pathlib.Path
+        Images of the evaluation split.
+    label_dir : pathlib.Path
+        YOLO labels of the split.
+    out_path : pathlib.Path
+        Destination ``.csv`` with :data:`BOX_COLUMNS`; boxes are pixel
+        ``x1 y1 x2 y2``, ``image_id`` is the image file name.
+    image_size : int
+        Inference size.
+    conf : float
+        Confidence threshold of the saved predictions.
+    device : str
+        Ultralytics device string.
+    iou_threshold : float, default=0.5
+        Minimum IoU for a TP match.
+
+    Returns
+    -------
+    pathlib.Path
+        The written file.
+    """
+    model = YOLO(str(weights))
+    rows = []
+    for image_path in list_images(image_dir):
+        width, height = load_rgb(image_path).size
+        labels = read_yolo_labels(Path(label_dir) / f"{image_path.stem}.txt")
+        result = model.predict(str(image_path), imgsz=image_size, conf=conf, device=device, verbose=False)[0]
+        boxes = result.boxes
+        records = match_boxes(yolo_to_xyxy(labels, width, height), labels[:, 0].astype(int),
+                              boxes.xyxy.cpu().numpy().reshape(-1, 4), boxes.cls.cpu().numpy().astype(int),
+                              boxes.conf.cpu().numpy(), iou_threshold)
+        rows.extend({"image_id": image_path.name, **record}
+                    for record in records or [{"status": "EMPTY"}])
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).reindex(columns=list(BOX_COLUMNS)).to_csv(out_path, index=False)
+    return out_path
 
 
 def load_training_log(run_dir: Path) -> pd.DataFrame:

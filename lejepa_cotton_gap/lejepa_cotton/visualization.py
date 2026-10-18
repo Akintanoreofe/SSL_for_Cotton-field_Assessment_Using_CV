@@ -170,6 +170,103 @@ def save_pretraining_loss_curves(history: pd.DataFrame, out_path: Path) -> Path:
     return save_figure(fig, out_path)
 
 
+def save_lambda_loss_curves(histories: Dict[float, pd.DataFrame], out_path: Path) -> Path:
+    """Plot total, prediction and SIGReg loss per epoch, one line per lambda.
+
+    Parameters
+    ----------
+    histories : dict of float to pandas.DataFrame
+        Lambda to loss history (columns ``epoch``, ``total``, ``pred``,
+        ``sigreg``).
+    out_path : pathlib.Path
+        Destination ``.png``.
+
+    Returns
+    -------
+    pathlib.Path
+        The written file.
+    """
+    panels = {"Total loss": "total", "Prediction loss": "pred", "SIGReg": "sigreg"}
+    fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4))
+    for ax, (title, column) in zip(axes, panels.items()):
+        for lam, history in sorted(histories.items()):
+            ax.plot(history["epoch"], history[column], label=f"$\\lambda$={lam:g}")
+        ax.set(title=title, xlabel="Epoch", ylabel="Loss")
+        ax.grid(True, alpha=0.4)
+        ax.legend(fontsize=8)
+    return save_figure(fig, out_path)
+
+
+def save_metric_vs_lambda(summary: pd.DataFrame, out_path: Path, baseline: str = "coco") -> Path:
+    """Line plot of mAP50 and mAP50-95 against lambda with a COCO baseline.
+
+    Parameters
+    ----------
+    summary : pandas.DataFrame
+        One row per model with columns ``variant``, ``lambda`` (NaN for the
+        baseline), ``mAP50`` and ``mAP50-95``.
+    out_path : pathlib.Path
+        Destination ``.png``.
+    baseline : str, default="coco"
+        ``variant`` value of the baseline row, drawn as dashed lines.
+
+    Returns
+    -------
+    pathlib.Path
+        The written file.
+    """
+    sweep = summary[summary["variant"] != baseline].sort_values("lambda")
+    base = summary[summary["variant"] == baseline]
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for metric in ("mAP50", "mAP50-95"):
+        line, = ax.plot(sweep["lambda"], sweep[metric], marker="o", label=f"LeJEPA {metric}")
+        if len(base):
+            ax.axhline(float(base[metric].iloc[0]), linestyle="--", color=line.get_color(),
+                       label=f"COCO {metric}")
+    ax.set(title="Detection accuracy vs $\\lambda$", xlabel="$\\lambda$ (SIGReg weight)", ylabel="Score")
+    ax.set_xticks(sweep["lambda"])
+    ax.grid(True, alpha=0.4)
+    ax.legend()
+    return save_figure(fig, out_path)
+
+
+def save_box_comparison(boxes_csv: Path, image_dir: Path, out_path: Path, max_images: int = 4) -> Path:
+    """Draw ground-truth (green) and predicted (red) boxes from a saved box file.
+
+    Parameters
+    ----------
+    boxes_csv : pathlib.Path
+        File written by :func:`core_evaluation.save_box_predictions`.
+    image_dir : pathlib.Path
+        Folder holding the images named by ``image_id``.
+    out_path : pathlib.Path
+        Destination ``.png`` (one panel per image).
+    max_images : int, default=4
+        Number of images drawn.
+
+    Returns
+    -------
+    pathlib.Path
+        The written file.
+    """
+    boxes = pd.read_csv(boxes_csv)
+    image_ids = list(dict.fromkeys(boxes["image_id"]))[:max_images]
+    fig, axes = plt.subplots(1, len(image_ids), figsize=(5 * len(image_ids), 5), squeeze=False)
+    for ax, image_id in zip(axes[0], image_ids):
+        image = load_rgb(Path(image_dir) / image_id)
+        draw = ImageDraw.Draw(image)
+        for row in boxes[boxes["image_id"] == image_id].itertuples():
+            if not np.isnan(row.gt_x1):
+                draw.rectangle([row.gt_x1, row.gt_y1, row.gt_x2, row.gt_y2], outline=(0, 200, 0), width=3)
+            if not np.isnan(row.pred_x1):
+                draw.rectangle([row.pred_x1, row.pred_y1, row.pred_x2, row.pred_y2],
+                               outline=(220, 0, 0), width=3)
+        ax.imshow(image)
+        ax.set_title(f"{image_id} (green=GT, red=pred)", fontsize=8)
+        ax.axis("off")
+    return save_figure(fig, out_path)
+
+
 def save_probe_loss_curves(histories: Dict[str, pd.DataFrame], out_path: Path) -> Path:
     """Overlay linear-probe train and test losses of several variants.
 
@@ -226,7 +323,7 @@ def save_detection_curves(run_dirs: Dict[str, Path], out_path: Path,
 
 
 def save_metric_bars(summary: pd.DataFrame, metrics: Sequence[str], title: str, out_path: Path,
-                     index: str = "variant") -> Path:
+                     index: str = "variant", figsize: Tuple[float, float] = (8, 5)) -> Path:
     """Grouped bar chart comparing final metrics across variants.
 
     Parameters
@@ -241,13 +338,15 @@ def save_metric_bars(summary: pd.DataFrame, metrics: Sequence[str], title: str, 
         Destination ``.png``.
     index : str, default="variant"
         Column naming each row.
+    figsize : tuple of float, default=(8, 5)
+        Figure size in inches.
 
     Returns
     -------
     pathlib.Path
         The written file.
     """
-    ax = summary.set_index(index)[list(metrics)].T.plot.bar(figsize=(8, 5), rot=0)
+    ax = summary.set_index(index)[list(metrics)].T.plot.bar(figsize=figsize, rot=0)
     ax.set(title=title, ylabel="Score", ylim=(0, 1))
     ax.grid(True, axis="y", alpha=0.4)
     for container in ax.containers:

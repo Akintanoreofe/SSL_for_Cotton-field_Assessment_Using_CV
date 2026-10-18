@@ -96,6 +96,29 @@ det = DetectionEvalConfig(source_dir="path/to/image_dataset", output_dir="output
 summary = run_detection_evaluation(det)
 ```
 
+## Lambda sweep and `intra_image` loss
+
+`PretrainConfig` now carries the sweep and loss-variant options (defaults shown): `lambdas=(0.1, 0.2, 0.3, 0.4, 0.5)`, `epochs=100`, `image_size=640` (multiple of 32, shared with detection), `pred_loss_mode="cross_camera"` or `"intra_image"`, `pool_cameras=(1, 2, 5, 6)`, `max_rotation_deg=15.0` and `overwrite=False`.
+
+- `"cross_camera"` (default, unchanged): each camera view is pulled toward the mean embedding of the other cameras.
+- `"intra_image"`: each image from `pool_cameras` yields two views (horizontal flip, vertical flip, rotation within ±`max_rotation_deg`; no crops or colour changes) and the MSE between their multi-scale GAP embeddings is the prediction loss. SIGReg is applied to the same embeddings.
+
+```python
+from lejepa_cotton import (PretrainConfig, DetectionEvalConfig, WeightSources,
+                           run_lambda_sweep, run_lambda_evaluation, plot_lambda_losses)
+
+pre = PretrainConfig(image_root="path/to/mars_multi_camera_boll", output_dir="outputs/pretraining",
+                     pred_loss_mode="intra_image")
+checkpoints = run_lambda_sweep(pre)        # outputs/pretraining/checkpoints/backbone_lambda_0.1.pt, ...
+plot_lambda_losses(pre)                    # total / prediction / SIGReg loss per lambda
+
+det = DetectionEvalConfig(source_dir="path/to/image_dataset", output_dir="outputs/detection",
+                          weights=WeightSources(lejepa_checkpoint=checkpoints[0.1]))
+summary = run_lambda_evaluation(det, checkpoints)
+```
+
+Per lambda, `checkpoints/` also holds `backbone_lambda_<λ>_config.json` and `_history.csv`. A λ with an existing checkpoint is skipped unless `overwrite=True`. `run_lambda_evaluation` fine-tunes each λ backbone and the COCO backbone (neck/head random for all) and writes `summary_metrics.csv`, `plots/map_vs_lambda.png` (COCO as dashed line), `plots/lambda_vs_coco_bars.png` and, per model, `eval/boxes_lambda_<λ>.csv` / `eval/boxes_coco.csv` (image id, GT and predicted boxes, confidence, class, IoU, status `TP`/`FP`/`FN`/`EMPTY`). The notebook `notebooks/run_gap_lejepa_pipeline.ipynb` runs this whole flow.
+
 ## Outputs
 
 ```
