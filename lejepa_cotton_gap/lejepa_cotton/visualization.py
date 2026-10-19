@@ -197,7 +197,7 @@ def save_lambda_loss_curves(histories: Dict[float, pd.DataFrame], out_path: Path
     return save_figure(fig, out_path)
 
 
-def save_metric_vs_lambda(summary: pd.DataFrame, out_path: Path, baseline: str = "coco") -> Path:
+def save_metric_vs_lambda(summary: pd.DataFrame, out_path: Path, baseline: str = "coco_backbone") -> Path:
     """Line plot of mAP50 and mAP50-95 against lambda with a COCO baseline.
 
     Parameters
@@ -207,7 +207,7 @@ def save_metric_vs_lambda(summary: pd.DataFrame, out_path: Path, baseline: str =
         baseline), ``mAP50`` and ``mAP50-95``.
     out_path : pathlib.Path
         Destination ``.png``.
-    baseline : str, default="coco"
+    baseline : str, default="coco_backbone"
         ``variant`` value of the baseline row, drawn as dashed lines.
 
     Returns
@@ -219,10 +219,10 @@ def save_metric_vs_lambda(summary: pd.DataFrame, out_path: Path, baseline: str =
     base = summary[summary["variant"] == baseline]
     fig, ax = plt.subplots(figsize=(7, 5))
     for metric in ("mAP50", "mAP50-95"):
-        line, = ax.plot(sweep["lambda"], sweep[metric], marker="o", label=f"LeJEPA {metric}")
+        line, = ax.plot(sweep["lambda"], sweep[metric], marker="o", label=f"LeJEPA Backbone {metric}")
         if len(base):
             ax.axhline(float(base[metric].iloc[0]), linestyle="--", color=line.get_color(),
-                       label=f"COCO {metric}")
+                       label=f"COCO Backbone {metric}")
     ax.set(title="Detection accuracy vs $\\lambda$", xlabel="$\\lambda$ (SIGReg weight)", ylabel="Score")
     ax.set_xticks(sweep["lambda"])
     ax.grid(True, alpha=0.4)
