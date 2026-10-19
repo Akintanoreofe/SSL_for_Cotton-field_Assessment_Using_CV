@@ -19,6 +19,7 @@ This module owns everything needed to *learn* a representation:
 
 from __future__ import annotations
 
+import os
 import re
 from collections import defaultdict
 from copy import deepcopy
@@ -287,6 +288,7 @@ def select_device(preferred: Optional[str] = None) -> torch.device:
     if preferred:
         return torch.device(preferred)
     if torch.backends.mps.is_available():
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         return torch.device("mps")
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -647,8 +649,40 @@ def make_loader(dataset: Dataset, cfg: PretrainConfig) -> DataLoader:
         drop_last=True,
         num_workers=cfg.num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=cfg.num_workers > 0,
         generator=torch.Generator().manual_seed(cfg.seed),
     )
+
+
+def build_pretraining_dataset(cfg: PretrainConfig, verbose: bool = True) -> Dataset:
+    """Create the dataset matching ``cfg.pred_loss_mode``.
+
+    Parameters
+    ----------
+    cfg : PretrainConfig
+        Pretraining configuration.
+    verbose : bool, default=True
+        Print dataset statistics.
+
+    Returns
+    -------
+    torch.utils.data.Dataset
+        Yields ``(views, camera_ids)`` with views of shape ``(V, 3, H, W)``.
+    """
+    if cfg.pred_loss_mode == "intra_image":
+        pool = subsample(discover_image_pool(cfg.image_root, cfg.pool_cameras, cfg.filename_pattern),
+                         cfg.max_samples, cfg.seed)
+        if verbose:
+            print(f"Image pool from cameras {cfg.pool_cameras}: {len(pool)} images.")
+        return ImagePoolDataset(pool, cfg.image_size, cfg.max_rotation_deg)
+    groups = discover_camera_groups(cfg.image_root, cfg.cameras, cfg.filename_pattern)
+    sampled = subsample(groups, cfg.max_samples, cfg.seed)
+    if verbose:
+        print(f"Synchronised frames for cameras {cfg.cameras}: {len(groups)} found, "
+              f"{len(sampled)} used ({len(sampled) * len(cfg.cameras)} images).")
+    dataset = MultiCameraViewDataset(sampled, cfg.cameras, build_train_transform(cfg.image_size),
+                                     cfg.views_per_camera)
+    return dataset
 
 
 def build_pretraining_loader(cfg: PretrainConfig, verbose: bool = True) -> DataLoader:
@@ -668,20 +702,7 @@ def build_pretraining_loader(cfg: PretrainConfig, verbose: bool = True) -> DataL
         ``(B, V)``; ``V`` is the number of camera views (``"cross_camera"``)
         or 2 (``"intra_image"``).
     """
-    if cfg.pred_loss_mode == "intra_image":
-        pool = subsample(discover_image_pool(cfg.image_root, cfg.pool_cameras, cfg.filename_pattern),
-                         cfg.max_samples, cfg.seed)
-        if verbose:
-            print(f"Image pool from cameras {cfg.pool_cameras}: {len(pool)} images.")
-        return make_loader(ImagePoolDataset(pool, cfg.image_size, cfg.max_rotation_deg), cfg)
-    groups = discover_camera_groups(cfg.image_root, cfg.cameras, cfg.filename_pattern)
-    sampled = subsample(groups, cfg.max_samples, cfg.seed)
-    if verbose:
-        print(f"Synchronised frames for cameras {cfg.cameras}: {len(groups)} found, "
-              f"{len(sampled)} used ({len(sampled) * len(cfg.cameras)} images).")
-    dataset = MultiCameraViewDataset(sampled, cfg.cameras, build_train_transform(cfg.image_size),
-                                     cfg.views_per_camera)
-    return make_loader(dataset, cfg)
+    return make_loader(build_pretraining_dataset(cfg, verbose), cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -1179,7 +1200,7 @@ def train_one_epoch(
     totals: Dict[str, float] = defaultdict(float)
     n_batches = 0
     for views, _ in tqdm.tqdm(loader, desc=desc, leave=False):
-        loss, logs = lejepa_loss(encoder(views.to(device)), sigreg, num_cameras, lam, pred_loss_mode)
+        loss, logs = lejepa_loss(encoder(views.to(device, non_blocking=True)), sigreg, num_cameras, lam, pred_loss_mode)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()

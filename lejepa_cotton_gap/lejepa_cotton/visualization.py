@@ -16,7 +16,9 @@ from sklearn.decomposition import PCA
 from ultralytics import YOLO
 
 from .core_evaluation import load_training_log, read_yolo_labels, yolo_to_xyxy
-from .core_pretraining import list_images, load_rgb
+from .core_pretraining import (
+    IMAGENET_MEAN, IMAGENET_STD, PretrainConfig, build_pretraining_dataset, list_images, load_rgb,
+)
 
 DETECTION_CURVE_METRICS = ("metrics/mAP50(B)", "metrics/mAP50-95(B)")
 
@@ -432,3 +434,50 @@ def save_detection_overlays(weights: Path, image_dir: Path, label_dir: Path, out
         written.append(out_dir / f"overlay_{image_path.name}")
         image.save(written[-1])
     return written
+
+
+def save_pretraining_view_examples(cfg: PretrainConfig, out_path: Path, num_samples: int = 3) -> Path:
+    """Draw the final views fed to the encoder, as used by the prediction loss.
+
+    Each row is one training sample; each column is one view, labelled with its
+    source camera (``cross_camera``) or view index (``intra_image``).
+
+    Parameters
+    ----------
+    cfg : PretrainConfig
+        Pretraining configuration (selects the mode, cameras and view size).
+    out_path : pathlib.Path
+        Destination image file.
+    num_samples : int, default=3
+        Number of samples (rows) shown.
+
+    Returns
+    -------
+    pathlib.Path
+        The written file.
+    """
+    dataset = build_pretraining_dataset(cfg, verbose=False)
+    rng = np.random.default_rng(cfg.seed)
+    indices = rng.choice(len(dataset), size=min(num_samples, len(dataset)), replace=False)
+    samples = [dataset[int(i)] for i in indices]
+    num_views = samples[0][0].shape[0]
+    mean = np.array(IMAGENET_MEAN).reshape(3, 1, 1)
+    std = np.array(IMAGENET_STD).reshape(3, 1, 1)
+    fig, axes = plt.subplots(len(samples), num_views, figsize=(3.2 * num_views, 3.4 * len(samples)), squeeze=False)
+    for row, (views, camera_ids) in enumerate(samples):
+        for col in range(num_views):
+            image = np.clip(views[col].numpy() * std + mean, 0, 1).transpose(1, 2, 0)
+            ax = axes[row, col]
+            ax.imshow(image)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if cfg.pred_loss_mode == "intra_image":
+                ax.set_title(f"Sample {row + 1} | View {col + 1}\n(camera {int(camera_ids[col])}, "
+                             f"rotation/flip/crop)", fontsize=9)
+            else:
+                ax.set_title(f"Sample {row + 1} | View {col + 1}\ncamera {int(camera_ids[col])}", fontsize=9)
+    fig.suptitle(f"Final views entering the encoder (mode: {cfg.pred_loss_mode}, "
+                 f"{cfg.image_size}x{cfg.image_size}, de-normalised for display).\n"
+                 "The prediction loss pulls the embeddings of the views in each row together.",
+                 fontsize=11)
+    return save_figure(fig, out_path)
