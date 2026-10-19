@@ -62,7 +62,7 @@ from .visualization import (
 
 DETECTION_METRICS = ("precision", "recall", "mAP50", "mAP50-95")
 PROBE_METRICS = ("accuracy", "macro_f1")
-COCO_MODEL_NAME = "coco"
+COCO_MODEL_NAME = "coco_backbone"
 
 
 def default_pca_epochs(epochs: int) -> Set[int]:
@@ -365,8 +365,8 @@ def run_lambda_evaluation(cfg: DetectionEvalConfig, checkpoints: Dict[float, Pat
     summary.to_csv(cfg.output_dir / "summary_metrics.csv", index=False)
     plots_dir = cfg.output_dir / "plots"
     save_metric_vs_lambda(summary, plots_dir / "map_vs_lambda.png", COCO_MODEL_NAME)
-    save_metric_bars(summary, DETECTION_METRICS, "Cotton boll detection: each $\\lambda$ vs COCO",
-                     plots_dir / "lambda_vs_coco_bars.png", figsize=(11, 5))
+    save_metric_bars(summary, DETECTION_METRICS, "Cotton boll detection: each $\\lambda$ vs COCO Backbone",
+                     plots_dir / "lambda_vs_coco_backbone_bars.png", figsize=(11, 5))
     return summary
 
 
