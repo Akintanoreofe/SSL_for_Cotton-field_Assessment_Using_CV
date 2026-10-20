@@ -6,6 +6,7 @@ import pytest
 import torch
 from ultralytics import YOLO
 
+from lejepa_cotton import core_pretraining
 from lejepa_cotton import (
     GeM,
     PretrainConfig,
@@ -21,6 +22,149 @@ from lejepa_cotton import (
     lejepa_loss,
     predict_video,
 )
+
+
+def test_train_one_epoch_averages_metrics_without_per_step_output(monkeypatch, capsys):
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(2.0))
+
+        def forward(self, views):
+            return {"feature": self.weight * views.mean()}
+
+        def clamp_gem_parameters(self):
+            pass
+
+    def fake_lejepa_loss(projections, *_args):
+        loss = projections["feature"].square()
+        return loss, {"total": loss.detach()}
+
+    monkeypatch.setattr(core_pretraining, "lejepa_loss", fake_lejepa_loss)
+    encoder = Encoder()
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(
+            torch.tensor([[[1.0]], [[3.0]]]),
+            torch.zeros(2, dtype=torch.long),
+            torch.zeros(2, dtype=torch.long),
+        ),
+        batch_size=1,
+    )
+    optimizer = torch.optim.SGD(encoder.parameters(), lr=0)
+
+    stats = core_pretraining.train_one_epoch(
+        encoder, loader, None, optimizer, 1, 0.2, torch.device("cpu")
+    )
+
+    # The batch losses are (2 * 1)^2 = 4 and (2 * 3)^2 = 36.
+    assert stats["total"] == pytest.approx(20.0)
+    assert capsys.readouterr().out == ""
+
+
+def test_train_one_epoch_returns_empty_stats_for_empty_loader():
+    encoder = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(encoder.parameters(), lr=0.01)
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(
+            torch.empty((0, 1, 1)),
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.long),
+        ),
+        batch_size=1,
+    )
+
+    stats = core_pretraining.train_one_epoch(
+        encoder, loader, None, optimizer, 1, 0.2, torch.device("cpu")
+    )
+
+    assert stats == {}
+
+
+def test_pretrain_rejects_empty_loader(tmp_path):
+    cfg = PretrainConfig(image_root=tmp_path, output_dir=tmp_path, epochs=1)
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(
+            torch.empty((0, 1, 1)),
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.long),
+        ),
+        batch_size=1,
+    )
+
+    with pytest.raises(ValueError, match="contains no batches"):
+        core_pretraining.pretrain(cfg, loader=loader, verbose=False)
+
+
+def test_pretrain_rejects_empty_unsized_loader(monkeypatch, tmp_path):
+    class EmptyIterableDataset(torch.utils.data.IterableDataset):
+        def __iter__(self):
+            return iter(())
+
+    monkeypatch.setattr(
+        core_pretraining,
+        "YOLOv8GAPEncoder",
+        lambda *_args, **_kwargs: torch.nn.Linear(1, 1),
+    )
+    cfg = PretrainConfig(image_root=tmp_path, output_dir=tmp_path, epochs=1)
+    loader = torch.utils.data.DataLoader(EmptyIterableDataset())
+
+    with pytest.raises(ValueError, match="yielded no batches"):
+        core_pretraining.pretrain(cfg, loader=loader, verbose=False)
+
+
+def test_train_one_epoch_enables_step_diagnostics_when_configured(monkeypatch, capsys, tmp_path):
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(2.0))
+
+        def forward(self, views):
+            return {"feature": self.weight * views.mean()}
+
+        def clamp_gem_parameters(self):
+            pass
+
+        def p_values(self):
+            return {"P3": 2.0}
+
+    def fake_lejepa_loss(projections, *_args):
+        loss = projections["feature"].square()
+        return loss, {"total": loss.detach()}
+
+    debug_paths = []
+    monkeypatch.setattr(core_pretraining, "lejepa_loss", fake_lejepa_loss)
+    monkeypatch.setattr(
+        core_pretraining,
+        "save_activation_debug_grid",
+        lambda _encoder, _views, path: debug_paths.append(path),
+    )
+    cfg = PretrainConfig(
+        image_root=tmp_path,
+        output_dir=tmp_path,
+        log_every_n_steps=1,
+        debug_every_n_steps=1,
+    )
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(
+            torch.tensor([[[1.0]], [[3.0]]]),
+            torch.zeros(2, dtype=torch.long),
+            torch.zeros(2, dtype=torch.long),
+        ),
+        batch_size=1,
+    )
+    encoder = Encoder()
+    optimizer = torch.optim.SGD(encoder.parameters(), lr=0)
+
+    core_pretraining.train_one_epoch(
+        encoder, loader, None, optimizer, 1, 0.2, torch.device("cpu"),
+        desc="train", cfg=cfg,
+    )
+
+    output = capsys.readouterr().out
+    assert "train step=1 P3.p=2.000" in output
+    assert "train step=2 P3.p=2.000" in output
+    assert len(debug_paths) == 2
+    assert debug_paths[0].name == "p3_activation_train_step_0000001.png"
 
 
 def test_gem_p_one_matches_gap_and_handles_negative_inputs():
@@ -52,6 +196,7 @@ def test_neck_returns_detect_scales_at_expected_strides():
 def test_gap_backbone_legacy_config_uses_all_scales_and_cross_camera(tmp_path):
     cfg = PretrainConfig(image_root=tmp_path, output_dir=tmp_path, pooling="gap",
                          pretrain_neck=False, rotation={"enabled": False})
+    assert cfg.log_every_n_steps == cfg.debug_every_n_steps == 0
     assert cfg.prediction_pairing == "cross_camera"
     assert cfg.scale_weights == {"p3": 1 / 3, "p4": 1 / 3, "p5": 1 / 3}
     torch.manual_seed(7)

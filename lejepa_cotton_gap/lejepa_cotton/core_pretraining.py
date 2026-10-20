@@ -33,7 +33,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import tqdm
 import ultralytics
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -147,6 +146,10 @@ class PretrainConfig:
         Seed for sampling, shuffling and initialisation.
     device : str or None, default=None
         Torch device string. ``None`` picks MPS, then CUDA, then CPU.
+    log_every_n_steps : int, default=0
+        Optional interval for learned-GeM logging; zero disables step logging.
+    debug_every_n_steps : int, default=0
+        Optional interval for activation debug grids; zero disables them.
     checkpoint_name : str, default="gap_lejepa_yolov8n.pth"
         File name of the checkpoint written inside ``output_dir``.
     """
@@ -176,8 +179,8 @@ class PretrainConfig:
     rotation: RotationConfig = field(default_factory=RotationConfig)
     global_scale: Tuple[float, float] = (0.4, 1.0)
     local_scale: Tuple[float, float] = (0.05, 0.25)
-    log_every_n_steps: int = 100
-    debug_every_n_steps: int = 100
+    log_every_n_steps: int = 0
+    debug_every_n_steps: int = 0
     overwrite: bool = False
     checkpoint_dir_name: str = "checkpoints"
     sigreg_knots: int = 17
@@ -230,8 +233,8 @@ class PretrainConfig:
         for name, scale in (("global_scale", self.global_scale), ("local_scale", self.local_scale)):
             if len(scale) != 2 or not 0 < scale[0] <= scale[1] <= 1:
                 raise ValueError(f"{name} must be a pair satisfying 0 < min <= max <= 1.")
-        if self.log_every_n_steps <= 0 or self.debug_every_n_steps <= 0:
-            raise ValueError("Logging and debug intervals must be positive.")
+        if self.log_every_n_steps < 0 or self.debug_every_n_steps < 0:
+            raise ValueError("Logging and debug intervals must be non-negative.")
         validate_image_size(self.image_size)
         if not all(0.0 <= v <= 1.0 for v in (self.lam, *self.lambdas)):
             raise ValueError("lam and every value of lambdas must lie in [0, 1].")
@@ -1386,19 +1389,27 @@ def train_one_epoch(
     device : torch.device
         Compute device.
     desc : str, default=""
-        Progress-bar label.
+        Optional label prefix for explicitly enabled step diagnostics.
+        No per-batch progress bar is displayed.
     pred_loss_mode : {"cross_camera", "intra_image"}, default="cross_camera"
         Prediction-loss variant.
+    cfg : PretrainConfig or None, default=None
+        Optional legacy per-step diagnostics configuration; intervals default
+        to zero so they are disabled unless explicitly enabled.
+    global_step : int, default=0
+        Starting step index for optional diagnostics, usually zero for each
+        epoch.
 
     Returns
     -------
     dict of str to float
-        Epoch-averaged loss components.
+        Epoch-averaged loss components, or an empty dictionary when the loader
+        yields no batches.
     """
     encoder.train()
-    totals: Dict[str, float] = defaultdict(float)
+    totals: Dict[str, torch.Tensor] = {}
     n_batches = 0
-    for batch in tqdm.tqdm(loader, desc=desc, leave=False):
+    for batch in loader:
         views, _, image_ids = batch if len(batch) == 3 else (*batch, None)
         views = views.to(device, non_blocking=True)
         image_ids = image_ids.to(device, non_blocking=True) if image_ids is not None else None
@@ -1410,16 +1421,31 @@ def train_one_epoch(
         optimizer.step()
         encoder.clamp_gem_parameters()
         for key, value in logs.items():
-            totals[key] += float(value.cpu())
+            if isinstance(value, torch.Tensor):
+                value = value.detach().float()
+                if value.device != device:
+                    value = value.to(device)
+            else:
+                value = torch.tensor(value, device=device, dtype=torch.float32)
+            value = value.reshape(())
+            totals[key] = totals[key] + value if key in totals else value
         n_batches += 1
         global_step += 1
-        if cfg and global_step % cfg.log_every_n_steps == 0:
-            print(f"step={global_step} " + " ".join(f"{name}.p={value:.3f}"
+        if cfg and cfg.log_every_n_steps and global_step % cfg.log_every_n_steps == 0:
+            label = f"{desc} " if desc else ""
+            print(f"{label}step={global_step} " + " ".join(f"{name}.p={value:.3f}"
                   for name, value in encoder.p_values().items()))
-        if cfg and global_step % cfg.debug_every_n_steps == 0:
-            debug_path = cfg.output_dir / "debug" / f"p3_activation_step_{global_step:07d}.png"
+        if cfg and cfg.debug_every_n_steps and global_step % cfg.debug_every_n_steps == 0:
+            label = re.sub(r"[^A-Za-z0-9_-]+", "_", desc).strip("_")
+            stem = f"p3_activation_{label}_step_{global_step:07d}" if label else \
+                f"p3_activation_step_{global_step:07d}"
+            debug_path = cfg.output_dir / "debug" / f"{stem}.png"
             save_activation_debug_grid(encoder, views, debug_path)
-    return {key: value / max(1, n_batches) for key, value in totals.items()}
+    if not totals:
+        return {}
+    keys = list(totals)
+    averages = torch.stack([totals[key] / n_batches for key in keys]).cpu().tolist()
+    return dict(zip(keys, averages))
 
 
 @torch.no_grad()
@@ -1470,7 +1496,7 @@ def pretrain(
     on_epoch_end : callable or None, default=None
         Called as ``on_epoch_end(epoch, encoder, loader)`` after each epoch.
     verbose : bool, default=True
-        Print one summary line per epoch.
+        Print one summary line per epoch; no per-batch progress bar is shown.
 
     Returns
     -------
@@ -1481,7 +1507,13 @@ def pretrain(
     """
     torch.manual_seed(cfg.seed)
     device = select_device(cfg.device)
-    loader = loader or build_pretraining_loader(cfg, verbose)
+    loader = build_pretraining_loader(cfg, verbose) if loader is None else loader
+    try:
+        batches_per_epoch = len(loader)
+    except TypeError:
+        batches_per_epoch = None
+    if batches_per_epoch == 0:
+        raise ValueError("Pretraining data loader contains no batches.")
     encoder = YOLOv8GAPEncoder(
         cfg.model_cfg, cfg.proj_dim, cfg.hidden_dim, cfg.pooling, cfg.gem,
         cfg.pretrain_neck, cfg.scale_weights,
@@ -1492,8 +1524,11 @@ def pretrain(
     records = []
     for epoch in range(cfg.epochs):
         stats = train_one_epoch(encoder, loader, sigreg, optimizer, len(cfg.cameras), cfg.lam, device,
-                                desc=f"Epoch {epoch + 1}/{cfg.epochs}", pred_loss_mode=cfg.prediction_pairing,
-                                scale_weights=cfg.scale_weights, cfg=cfg, global_step=epoch * len(loader))
+                                desc=f"Epoch {epoch + 1}/{cfg.epochs}",
+                                pred_loss_mode=cfg.prediction_pairing, scale_weights=cfg.scale_weights,
+                                cfg=cfg)
+        if not stats:
+            raise ValueError("Pretraining data loader yielded no batches.")
         stats.update({f"p_{name.lower()}": value for name, value in encoder.p_values().items()})
         records.append({"epoch": epoch + 1, **stats})
         if verbose:
