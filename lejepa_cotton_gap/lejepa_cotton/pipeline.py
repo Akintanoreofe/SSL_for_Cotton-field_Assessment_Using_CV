@@ -60,7 +60,7 @@ from .visualization import (
     save_probe_loss_curves,
 )
 
-DETECTION_METRICS = ("precision", "recall", "mAP50", "mAP50-95")
+DETECTION_METRICS = ("precision", "recall", "mAP50", "mAP50-95", "mAP75")
 PROBE_METRICS = ("accuracy", "macro_f1")
 COCO_MODEL_NAME = "coco_backbone"
 
@@ -95,7 +95,7 @@ def log_pretraining_pca(epoch: int, encoder: YOLOv8GAPEncoder, loader: DataLoade
     encoder : YOLOv8GAPEncoder
         Encoder being trained.
     loader : torch.utils.data.DataLoader
-        Pretraining loader yielding ``(views, camera_ids)``.
+        Pretraining loader yielding ``(views, camera_ids, image_ids)``.
     epochs_to_log : set of int
         Zero-based epochs to visualise.
     out_dir : pathlib.Path
@@ -112,7 +112,7 @@ def log_pretraining_pca(epoch: int, encoder: YOLOv8GAPEncoder, loader: DataLoade
         return None
     features, cameras = extract_embeddings(encoder, loader, max_batches)
     return save_pca_3d(features, [f"cam{c}" for c in cameras],
-                       f"GAP LeJEPA embeddings - epoch {epoch + 1}",
+                       f"LeJEPA embeddings - epoch {epoch + 1}",
                        Path(out_dir) / f"pca_epoch_{epoch + 1:03d}.html", legend_title="camera")
 
 

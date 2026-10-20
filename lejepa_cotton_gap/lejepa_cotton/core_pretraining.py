@@ -23,7 +23,7 @@ import os
 import re
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -46,11 +46,37 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 DEFAULT_FILENAME_PATTERN = r"clip(?P<clip>\d+)_cam(?P<cam>\d+)_frame(?P<frame>\d+)"
 EMPTY_MODEL_CFG = "yolov8n.yaml"
 PRED_LOSS_MODES = ("cross_camera", "intra_image")
+POOLING_MODES = ("gem", "gap")
+TRANSFER_MODES = ("backbone", "backbone+neck")
+PREDICTION_PAIRINGS = ("intra_image", "cross_camera")
 DEFAULT_LAMBDAS = (0.1, 0.2, 0.3, 0.4, 0.5)
 DEFAULT_IMAGE_SIZE = 640
 
 CameraGroup = Dict[int, Path]
 EpochCallback = Callable[[int, nn.Module, DataLoader], None]
+
+
+@dataclass
+class GeMConfig:
+    p_init: float = 3.0
+    p_min: float = 1.0
+    p_max: float = 6.0
+    learnable_p: bool = True
+
+    def __post_init__(self) -> None:
+        if self.p_min <= 0 or not self.p_min <= self.p_init <= self.p_max:
+            raise ValueError("GeM requires 0 < p_min <= p_init <= p_max.")
+
+
+@dataclass
+class RotationConfig:
+    enabled: bool = True
+    max_deg: float = 15.0
+    p: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.max_deg < 0 or not 0.0 <= self.p <= 1.0:
+            raise ValueError("rotation.max_deg must be non-negative and rotation.p must lie in [0, 1].")
 
 
 # --------------------------------------------------------------------------- #
@@ -97,6 +123,8 @@ class PretrainConfig:
         SIGReg weights pretrained one after another by the lambda sweep.
     pred_loss_mode : {"cross_camera", "intra_image"}, default="cross_camera"
         Which prediction loss is used (see :func:`prediction_loss`).
+    pooling : {"gem", "gap"}, default="gem"
+        Spatial pooling applied independently to each selected scale.
     pool_cameras : tuple of int, default=(1, 2, 5, 6)
         Camera ids (as written in the file names) whose images form the pool
         of the ``"intra_image"`` mode.
@@ -137,8 +165,19 @@ class PretrainConfig:
     weight_decay: float = 1e-4
     lam: float = 0.2
     lambdas: Tuple[float, ...] = DEFAULT_LAMBDAS
-    pred_loss_mode: str = "cross_camera"
+    pred_loss_mode: Optional[str] = None
+    prediction_pairing: str = "intra_image"
     pool_cameras: Tuple[int, ...] = (1, 2, 5, 6)
+    pooling: str = "gem"
+    gem: GeMConfig = field(default_factory=GeMConfig)
+    pretrain_neck: bool = True
+    scale_weights: Dict[str, float] = field(default_factory=lambda: {"p3": 1.0, "p4": 0.0, "p5": 0.0})
+    transfer: str = "backbone"
+    rotation: RotationConfig = field(default_factory=RotationConfig)
+    global_scale: Tuple[float, float] = (0.4, 1.0)
+    local_scale: Tuple[float, float] = (0.05, 0.25)
+    log_every_n_steps: int = 100
+    debug_every_n_steps: int = 100
     overwrite: bool = False
     checkpoint_dir_name: str = "checkpoints"
     sigreg_knots: int = 17
@@ -156,12 +195,37 @@ class PretrainConfig:
         self.cameras = tuple(int(c) for c in self.cameras)
         self.pool_cameras = tuple(int(c) for c in self.pool_cameras)
         self.lambdas = tuple(float(v) for v in self.lambdas)
-        if self.pred_loss_mode not in PRED_LOSS_MODES:
+        if self.pred_loss_mode is not None and self.pred_loss_mode not in PRED_LOSS_MODES:
             raise ValueError(f"pred_loss_mode must be one of {PRED_LOSS_MODES}, got '{self.pred_loss_mode}'.")
-        if self.pred_loss_mode == "cross_camera" and len(self.cameras) < 2:
+        if self.prediction_pairing not in PREDICTION_PAIRINGS:
+            raise ValueError(f"prediction_pairing must be one of {PREDICTION_PAIRINGS}.")
+        if self.pred_loss_mode is not None:
+            self.prediction_pairing = self.pred_loss_mode
+        if self.pooling not in POOLING_MODES:
+            raise ValueError(f"pooling must be one of {POOLING_MODES}, got '{self.pooling}'.")
+        if self.transfer not in TRANSFER_MODES:
+            raise ValueError(f"transfer must be one of {TRANSFER_MODES}, got '{self.transfer}'.")
+        if self.transfer == "backbone+neck" and not self.pretrain_neck:
+            raise ValueError("transfer='backbone+neck' requires pretrain_neck=True.")
+        self.scale_weights = {str(k).lower(): float(v) for k, v in self.scale_weights.items()}
+        if set(self.scale_weights) - {"p3", "p4", "p5"} or any(v < 0 for v in self.scale_weights.values()):
+            raise ValueError("scale_weights must contain non-negative p3, p4 and/or p5 weights.")
+        if self.pooling == "gap" and not self.pretrain_neck and not self.rotation.enabled:
+            if self.pred_loss_mode is None and self.prediction_pairing == "intra_image":
+                self.prediction_pairing = "cross_camera"
+            if self.scale_weights == {"p3": 1.0, "p4": 0.0, "p5": 0.0}:
+                self.scale_weights = {"p3": 1 / 3, "p4": 1 / 3, "p5": 1 / 3}
+        if not any(self.scale_weights.get(k, 0.0) > 0 for k in ("p3", "p4", "p5")):
+            raise ValueError("At least one scale weight must be positive.")
+        if self.prediction_pairing == "cross_camera" and len(self.cameras) < 2:
             raise ValueError("Cross-camera prediction needs at least two cameras.")
-        if self.pred_loss_mode == "intra_image" and not self.pool_cameras:
+        if self.prediction_pairing == "intra_image" and not self.pool_cameras:
             raise ValueError("Intra-image prediction needs at least one pool camera.")
+        for name, scale in (("global_scale", self.global_scale), ("local_scale", self.local_scale)):
+            if len(scale) != 2 or not 0 < scale[0] <= scale[1] <= 1:
+                raise ValueError(f"{name} must be a pair satisfying 0 < min <= max <= 1.")
+        if self.log_every_n_steps <= 0 or self.debug_every_n_steps <= 0:
+            raise ValueError("Logging and debug intervals must be positive.")
         validate_image_size(self.image_size)
         if not all(0.0 <= v <= 1.0 for v in (self.lam, *self.lambdas)):
             raise ValueError("lam and every value of lambdas must lie in [0, 1].")
@@ -404,7 +468,31 @@ def discover_camera_groups(
 # --------------------------------------------------------------------------- #
 # Augmentation and dataset
 # --------------------------------------------------------------------------- #
-def build_train_transform(image_size: int) -> v2.Compose:
+class RandomRotationReflect:
+    """Sample an independent, reflect-padded rotation for each transformed view."""
+
+    def __init__(self, max_deg: float = 15.0, p: float = 0.5, enabled: bool = True) -> None:
+        self.max_deg = float(max_deg)
+        self.p = float(p)
+        self.enabled = bool(enabled)
+        self.last_angle = 0.0
+
+    def __call__(self, image: torch.Tensor) -> torch.Tensor:
+        self.last_angle = 0.0
+        if not self.enabled or torch.rand(()) >= self.p:
+            return image
+        self.last_angle = float(torch.empty(()).uniform_(-self.max_deg, self.max_deg))
+        radians = np.deg2rad(self.last_angle)
+        theta = image.new_tensor([[
+            [np.cos(radians), -np.sin(radians), 0.0],
+            [np.sin(radians), np.cos(radians), 0.0],
+        ]])
+        grid = F.affine_grid(theta, (1, *image.shape), align_corners=False)
+        return F.grid_sample(image.unsqueeze(0), grid, mode="bilinear",
+                             padding_mode="reflection", align_corners=False).squeeze(0)
+
+
+def build_train_transform(image_size: int, rotation: Optional[RotationConfig] = None) -> v2.Compose:
     """Resize and randomly flip every camera view independently.
 
     Flips provide orientation variation while preserving the full cotton
@@ -421,12 +509,14 @@ def build_train_transform(image_size: int) -> v2.Compose:
     torchvision.transforms.v2.Compose
         PIL image to normalised ``float32`` tensor pipeline.
     """
+    rotation = rotation or RotationConfig(enabled=False)
     return v2.Compose([
         v2.Resize((image_size, image_size)),
         v2.RandomHorizontalFlip(0.5),
         v2.RandomVerticalFlip(0.5),
         v2.ToImage(),
         v2.ToDtype(torch.float32, scale=True),
+        RandomRotationReflect(rotation.max_deg, rotation.p, rotation.enabled),
         v2.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
 
@@ -485,7 +575,7 @@ class MultiCameraViewDataset(Dataset):
         """
         return len(self.groups)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Load and augment all camera views of one frame.
 
         Parameters
@@ -499,6 +589,8 @@ class MultiCameraViewDataset(Dataset):
             Shape ``(V, 3, H, W)`` ordered camera-major.
         camera_ids : torch.Tensor
             Shape ``(V,)`` camera id of each view.
+        image_ids : torch.Tensor
+            Shape ``(V,)`` source-image group id for each view.
         """
         views, camera_ids = [], []
         for cam in self.cameras:
@@ -506,7 +598,7 @@ class MultiCameraViewDataset(Dataset):
             for _ in range(self.views_per_camera):
                 views.append(self.transform(image))
                 camera_ids.append(cam)
-        return torch.stack(views), torch.tensor(camera_ids)
+        return torch.stack(views), torch.tensor(camera_ids), torch.full((len(views),), idx)
 
 
 def discover_image_pool(root: Path, cameras: Sequence[int],
@@ -544,7 +636,8 @@ def discover_image_pool(root: Path, cameras: Sequence[int],
     return pool
 
 
-def build_geometric_views(image: Image.Image, image_size: int) -> torch.Tensor:
+def build_geometric_views(image: Image.Image, image_size: int, global_scale: Tuple[float, float] = (0.4, 1.0),
+                          rotation: Optional[RotationConfig] = None) -> torch.Tensor:
     """Create two randomly flipped views of one image, without rotation.
 
     The image is resized to the model input size, then independent horizontal
@@ -565,20 +658,17 @@ def build_geometric_views(image: Image.Image, image_size: int) -> torch.Tensor:
     torch.Tensor
         Normalised views of shape ``(2, 3, image_size, image_size)``.
     """
+    rotation = rotation or RotationConfig(enabled=False)
     transform = v2.Compose([
-        v2.Resize((image_size, image_size)),
+        v2.RandomResizedCrop((image_size, image_size), scale=global_scale),
         v2.RandomHorizontalFlip(0.5),
         v2.RandomVerticalFlip(0.5),
         v2.ToImage(),
         v2.ToDtype(torch.float32, scale=True),
+        RandomRotationReflect(rotation.max_deg, rotation.p, rotation.enabled),
         v2.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
-    view1 = transform(image)
-    # Derive a second view using an additional random reflection. The three
-    # equally likely choices preserve the full frame and its square dimensions.
-    dims = [[-1], [-2], [-2, -1]][int(torch.randint(3, (1,)))]
-    view2 = torch.flip(view1, dims)
-    return torch.stack([view1, view2])
+    return torch.stack([transform(image), transform(image)])
 
 
 class ImagePoolDataset(Dataset):
@@ -592,9 +682,13 @@ class ImagePoolDataset(Dataset):
         Side length of the views.
     """
 
-    def __init__(self, pool: List[Tuple[Path, int]], image_size: int) -> None:
+    def __init__(self, pool: List[Tuple[Path, int]], image_size: int,
+                 global_scale: Tuple[float, float] = (0.4, 1.0),
+                 rotation: Optional[RotationConfig] = None) -> None:
         self.pool = pool
         self.image_size = image_size
+        self.global_scale = global_scale
+        self.rotation = rotation or RotationConfig(enabled=False)
 
     def __len__(self) -> int:
         """Return the number of images in the pool.
@@ -606,7 +700,7 @@ class ImagePoolDataset(Dataset):
         """
         return len(self.pool)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Load one image and build its two views.
 
         Parameters
@@ -620,10 +714,12 @@ class ImagePoolDataset(Dataset):
             Shape ``(2, 3, H, W)``.
         camera_ids : torch.Tensor
             Shape ``(2,)``; the source camera repeated for both views.
+        image_ids : torch.Tensor
+            Shape ``(2,)``; source-image group id repeated for both views.
         """
         path, camera = self.pool[idx]
-        views = build_geometric_views(load_rgb(path), self.image_size)
-        return views, torch.full((2,), camera)
+        views = build_geometric_views(load_rgb(path), self.image_size, self.global_scale, self.rotation)
+        return views, torch.full((2,), camera), torch.full((2,), idx)
 
 
 def make_loader(dataset: Dataset, cfg: PretrainConfig) -> DataLoader:
@@ -632,7 +728,7 @@ def make_loader(dataset: Dataset, cfg: PretrainConfig) -> DataLoader:
     Parameters
     ----------
     dataset : torch.utils.data.Dataset
-        Dataset yielding ``(views, camera_ids)``.
+        Dataset yielding ``(views, camera_ids, image_ids)``.
     cfg : PretrainConfig
         Provides batch size, workers and seed.
 
@@ -666,20 +762,20 @@ def build_pretraining_dataset(cfg: PretrainConfig, verbose: bool = True) -> Data
     Returns
     -------
     torch.utils.data.Dataset
-        Yields ``(views, camera_ids)`` with views of shape ``(V, 3, H, W)``.
+        Yields ``(views, camera_ids, image_ids)`` with views of shape ``(V, 3, H, W)``.
     """
-    if cfg.pred_loss_mode == "intra_image":
+    if cfg.prediction_pairing == "intra_image":
         pool = subsample(discover_image_pool(cfg.image_root, cfg.pool_cameras, cfg.filename_pattern),
                          cfg.max_samples, cfg.seed)
         if verbose:
             print(f"Image pool from cameras {cfg.pool_cameras}: {len(pool)} images.")
-        return ImagePoolDataset(pool, cfg.image_size)
+        return ImagePoolDataset(pool, cfg.image_size, cfg.global_scale, cfg.rotation)
     groups = discover_camera_groups(cfg.image_root, cfg.cameras, cfg.filename_pattern)
     sampled = subsample(groups, cfg.max_samples, cfg.seed)
     if verbose:
         print(f"Synchronised frames for cameras {cfg.cameras}: {len(groups)} found, "
               f"{len(sampled)} used ({len(sampled) * len(cfg.cameras)} images).")
-    dataset = MultiCameraViewDataset(sampled, cfg.cameras, build_train_transform(cfg.image_size),
+    dataset = MultiCameraViewDataset(sampled, cfg.cameras, build_train_transform(cfg.image_size, cfg.rotation),
                                      cfg.views_per_camera)
     return dataset
 
@@ -697,7 +793,7 @@ def build_pretraining_loader(cfg: PretrainConfig, verbose: bool = True) -> DataL
     Returns
     -------
     torch.utils.data.DataLoader
-        Yields ``(views, camera_ids)`` with shapes ``(B, V, 3, H, W)`` and
+        Yields ``(views, camera_ids, image_ids)`` with shapes ``(B, V, 3, H, W)`` and
         ``(B, V)``; ``V`` is the number of camera views (``"cross_camera"``)
         or 2 (``"intra_image"``).
     """
@@ -723,6 +819,35 @@ def global_average_pool(feature_map: torch.Tensor) -> torch.Tensor:
     return F.adaptive_avg_pool2d(feature_map, 1).flatten(1)
 
 
+class GeM(nn.Module):
+    """Generalized mean pooling with a bounded, optionally learnable exponent."""
+
+    def __init__(self, p_init: float = 3.0, p_min: float = 1.0, p_max: float = 6.0,
+                 learnable_p: bool = True, eps: float = 1e-6) -> None:
+        super().__init__()
+        if not 0 < p_min <= p_init <= p_max:
+            raise ValueError("GeM requires 0 < p_min <= p_init <= p_max.")
+        self.p_min, self.p_max, self.eps = float(p_min), float(p_max), float(eps)
+        value = torch.tensor(float(p_init))
+        if learnable_p:
+            self.p = nn.Parameter(value)
+        else:
+            self.register_buffer("p", value)
+
+    @property
+    def p_value(self) -> torch.Tensor:
+        return self.p.clamp(self.p_min, self.p_max)
+
+    def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
+        p = self.p_value
+        pooled = feature_map.clamp_min(self.eps).pow(p).mean(dim=(-2, -1))
+        return pooled.pow(p.reciprocal())
+
+    @torch.no_grad()
+    def clamp_parameter(self) -> None:
+        self.p.clamp_(self.p_min, self.p_max)
+
+
 class YOLOv8MultiScaleBackbone(nn.Module):
     """First ten YOLOv8 layers returning the P3, P4 and P5 feature maps.
 
@@ -736,10 +861,18 @@ class YOLOv8MultiScaleBackbone(nn.Module):
     NUM_LAYERS = 10
     CAPTURE = {4: "P3", 6: "P4", 9: "P5"}
 
-    def __init__(self, weights: str = EMPTY_MODEL_CFG) -> None:
+    def __init__(self, weights: str = EMPTY_MODEL_CFG, pretrain_neck: bool = False) -> None:
         super().__init__()
         detection_model = YOLO(str(weights)).model
-        self.layers = nn.ModuleList(list(detection_model.model[: self.NUM_LAYERS]))
+        detect_layer = detection_model.model[-1]
+        detect_sources = tuple(int(i) for i in detect_layer.f)
+        if len(detect_sources) != 3:
+            raise ValueError(f"Expected three Detect input scales, found {detect_sources}.")
+        self.pretrain_neck = bool(pretrain_neck)
+        self.detect_sources = detect_sources
+        self.capture_indices = dict(zip(detect_sources, ("P3", "P4", "P5"))) if pretrain_neck else self.CAPTURE
+        end = max(detect_sources) + 1 if pretrain_neck else self.NUM_LAYERS
+        self.layers = nn.ModuleList(list(detection_model.model[:end]))
         self.weights = str(weights)
         for param in self.parameters():
             param.requires_grad_(True)
@@ -747,7 +880,7 @@ class YOLOv8MultiScaleBackbone(nn.Module):
     @property
     def scale_names(self) -> List[str]:
         """list of str : Names of the returned scales."""
-        return list(self.CAPTURE.values())
+        return list(self.capture_indices.values())
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Compute multi-scale feature maps.
@@ -763,10 +896,18 @@ class YOLOv8MultiScaleBackbone(nn.Module):
             ``{"P3": ..., "P4": ..., "P5": ...}`` each ``(N, C, h, w)``.
         """
         features = {}
+        outputs = []
         for index, layer in enumerate(self.layers):
+            source = layer.f
+            if source != -1:
+                if isinstance(source, int):
+                    x = outputs[source]
+                else:
+                    x = [x if item == -1 else outputs[item] for item in source]
             x = layer(x)
-            if index in self.CAPTURE:
-                features[self.CAPTURE[index]] = x
+            outputs.append(x)
+            if index in self.capture_indices:
+                features[self.capture_indices[index]] = x
         return features
 
     def forward_pooled(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -847,13 +988,32 @@ class YOLOv8GAPEncoder(nn.Module):
         Projector hidden width.
     """
 
-    def __init__(self, model_cfg: str = EMPTY_MODEL_CFG, proj_dim: int = 128, hidden_dim: int = 256) -> None:
+    def __init__(self, model_cfg: str = EMPTY_MODEL_CFG, proj_dim: int = 128, hidden_dim: int = 256,
+                 pooling: str = "gap", gem: Optional[GeMConfig] = None, pretrain_neck: bool = False,
+                 scale_weights: Optional[Dict[str, float]] = None) -> None:
         super().__init__()
-        self.init_kwargs = {"model_cfg": str(model_cfg), "proj_dim": proj_dim, "hidden_dim": hidden_dim}
-        self.backbone = YOLOv8MultiScaleBackbone(model_cfg)
+        if pooling not in POOLING_MODES:
+            raise ValueError(f"pooling must be one of {POOLING_MODES}, got '{pooling}'.")
+        if isinstance(gem, dict):
+            gem = GeMConfig(**gem)
+        gem = gem or GeMConfig()
+        self.init_kwargs = {"model_cfg": str(model_cfg), "proj_dim": proj_dim, "hidden_dim": hidden_dim,
+                            "pooling": pooling, "gem": asdict(gem), "pretrain_neck": pretrain_neck,
+                            "scale_weights": scale_weights}
+        self.pooling = pooling
+        self.scale_weights = {str(k).lower(): float(v) for k, v in (scale_weights or
+                              {"p3": 1.0, "p4": 1.0, "p5": 1.0}).items()}
+        self.backbone = YOLOv8MultiScaleBackbone(model_cfg, pretrain_neck=pretrain_neck)
+        channels = self.backbone.out_channels()
+        active_scales = [name for name in self.backbone.scale_names
+                         if self.scale_weights.get(name.lower(), 0.0) > 0]
+        self.poolers = nn.ModuleDict({
+            name: (GeM(gem.p_init, gem.p_min, gem.p_max, gem.learnable_p) if pooling == "gem"
+                   else nn.Identity()) for name in active_scales
+        })
         self.projectors = nn.ModuleDict({
-            name: build_gap_projector(channels, hidden_dim, proj_dim)
-            for name, channels in self.backbone.out_channels().items()
+            name: build_gap_projector(channels[name], hidden_dim, proj_dim)
+            for name in active_scales
         })
 
     def project(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -869,8 +1029,23 @@ class YOLOv8GAPEncoder(nn.Module):
         dict of str to torch.Tensor
             Projections of shape ``(N, proj_dim)`` per scale.
         """
-        pooled = self.backbone.forward_pooled(images)
+        maps = self.backbone(images)
+        pooled = {
+            name: (global_average_pool(feature) if self.pooling == "gap"
+                   else self.poolers[name](feature))
+            for name, feature in maps.items() if name in self.projectors
+        }
         return {name: self.projectors[name](vec) for name, vec in pooled.items()}
+
+    def p_values(self) -> Dict[str, float]:
+        return {name: float(module.p_value.detach().cpu()) for name, module in self.poolers.items()
+                if isinstance(module, GeM)}
+
+    @torch.no_grad()
+    def clamp_gem_parameters(self) -> None:
+        for module in self.poolers.values():
+            if isinstance(module, GeM):
+                module.clamp_parameter()
 
     def forward(self, views: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Project every view of every sample.
@@ -1034,7 +1209,19 @@ def cross_camera_prediction_loss(z: torch.Tensor, num_cameras: int) -> torch.Ten
     return (per_camera - other_means.unsqueeze(2)).square().mean()
 
 
-def intra_image_prediction_loss(z: torch.Tensor) -> torch.Tensor:
+def assert_image_groups(image_ids: Optional[torch.Tensor], batch: int, num_views: int) -> None:
+    """Ensure each prediction row contains views from exactly one source image."""
+    if image_ids is None:
+        return
+    if image_ids.shape != (batch, num_views):
+        raise AssertionError(f"image_ids must have shape {(batch, num_views)}, got {tuple(image_ids.shape)}.")
+    if not torch.equal(image_ids, image_ids[:, :1].expand_as(image_ids)):
+        raise AssertionError("Prediction groups mix views from different source images.")
+    if torch.unique(image_ids[:, 0]).numel() != batch:
+        raise AssertionError("A source image appears in more than one prediction group.")
+
+
+def intra_image_prediction_loss(z: torch.Tensor, image_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Variant 2 of ``L_pred``: compare two geometric views of one image.
 
     Both views are augmented copies of the *same* image (random flips only,
@@ -1057,16 +1244,15 @@ def intra_image_prediction_loss(z: torch.Tensor) -> torch.Tensor:
     ValueError
         If ``z`` does not hold exactly two views per image.
     """
-    if z.dim() != 3 or z.shape[1] != 2:
-        raise ValueError(f"intra-image loss needs shape (B, 2, D), got {tuple(z.shape)}.")
-    # The two entries are the independently augmented versions of one image.
-    # Their squared distance is symmetric, so one MSE compares both directions
-    # (view 0 as predictor of view 1 and view 1 as predictor of view 0). Averaging
-    # over the batch and embedding dimensions returns one scalar.
-    return (z[:, 0] - z[:, 1]).square().mean()
+    if z.dim() != 3 or z.shape[1] < 2:
+        raise ValueError(f"intra-image loss needs shape (B, V>=2, D), got {tuple(z.shape)}.")
+    assert_image_groups(image_ids, z.shape[0], z.shape[1])
+    targets = z.mean(dim=1, keepdim=True)
+    return (z - targets).square().mean()
 
 
-def prediction_loss(z: torch.Tensor, mode: str, num_cameras: int = 0) -> torch.Tensor:
+def prediction_loss(z: torch.Tensor, mode: str, num_cameras: int = 0,
+                    image_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Dispatch to the prediction loss selected by ``pred_loss_mode``.
 
     Parameters
@@ -1088,10 +1274,12 @@ def prediction_loss(z: torch.Tensor, mode: str, num_cameras: int = 0) -> torch.T
     ValueError
         If ``mode`` is unknown.
     """
+    if image_ids is not None:
+        assert_image_groups(image_ids, z.shape[0], z.shape[1])
     if mode == "cross_camera":
         return cross_camera_prediction_loss(z, num_cameras)
     if mode == "intra_image":
-        return intra_image_prediction_loss(z)
+        return intra_image_prediction_loss(z, image_ids)
     raise ValueError(f"pred_loss_mode must be one of {PRED_LOSS_MODES}, got '{mode}'.")
 
 
@@ -1101,6 +1289,8 @@ def lejepa_loss(
     num_cameras: int,
     lam: float,
     pred_loss_mode: str = "cross_camera",
+    scale_weights: Optional[Dict[str, float]] = None,
+    image_ids: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Combine the prediction loss and SIGReg over all scales.
 
@@ -1125,27 +1315,27 @@ def lejepa_loss(
         Detached components (``total``, ``pred``, ``sigreg`` and per scale).
     """
     logs: Dict[str, torch.Tensor] = {}
+    if scale_weights is None:
+        scale_weights = {name.lower(): 1.0 / len(projections) for name in projections}
+    active_weights = {name: float(scale_weights.get(name.lower(), 0.0)) for name in projections}
+    if not any(weight > 0 for weight in active_weights.values()):
+        raise ValueError("At least one projected scale must have a positive loss weight.")
     for name, z in projections.items():
         # Each backbone scale has its own projected embeddings z with shape
         # (batch, views, projection_dim). Its selected prediction objective
         # encourages agreement across cameras or between two transforms of one
         # image, depending on `pred_loss_mode`.
-        logs[f"pred_{name}"] = prediction_loss(z, pred_loss_mode, num_cameras)
+        logs[f"pred_{name}"] = prediction_loss(z, pred_loss_mode, num_cameras, image_ids)
         # SIGReg is independent of the prediction mode. Put views first because
         # SIGReg interprets its leading axis as separate view groups and tests
         # each group's batch distribution against N(0, I): (B, V, D) -> (V, B, D).
         logs[f"sigreg_{name}"] = sigreg(z.transpose(0, 1))
-    # The loss is computed independently at P3, P4, and P5. Average those scalar
-    # terms so no feature scale is selected in advance or counted more heavily
-    # merely because its feature map has a different spatial resolution.
-    pred = torch.stack([logs[f"pred_{n}"] for n in projections]).mean()
-    sig = torch.stack([logs[f"sigreg_{n}"] for n in projections]).mean()
-    # Lambda is the SIGReg weight, not the prediction weight:
-    #   lam = 0: only view agreement is optimized (which alone can collapse);
-    #   lam = 1: only Gaussian-distribution regularisation is optimized;
-    # intermediate values trade agreement against a spread, non-collapsed
-    # embedding. Both components have already been averaged over scales.
-    loss = (1.0 - lam) * pred + lam * sig
+    loss = sum(
+        active_weights[name] * ((1.0 - lam) * logs[f"pred_{name}"] + lam * logs[f"sigreg_{name}"])
+        for name in projections
+    )
+    pred = sum(active_weights[name] * logs[f"pred_{name}"] for name in projections)
+    sig = sum(active_weights[name] * logs[f"sigreg_{name}"] for name in projections)
     logs.update(total=loss, pred=pred, sigreg=sig)
     # Keep the training loss attached to autograd, but detach every value saved
     # for reporting so epoch-history accumulation does not retain computation
@@ -1166,6 +1356,9 @@ def train_one_epoch(
     device: torch.device,
     desc: str = "",
     pred_loss_mode: str = "cross_camera",
+    scale_weights: Optional[Dict[str, float]] = None,
+    cfg: Optional[PretrainConfig] = None,
+    global_step: int = 0,
 ) -> Dict[str, float]:
     """Run one optimisation pass over the loader.
 
@@ -1198,15 +1391,59 @@ def train_one_epoch(
     encoder.train()
     totals: Dict[str, float] = defaultdict(float)
     n_batches = 0
-    for views, _ in tqdm.tqdm(loader, desc=desc, leave=False):
-        loss, logs = lejepa_loss(encoder(views.to(device, non_blocking=True)), sigreg, num_cameras, lam, pred_loss_mode)
+    for batch in tqdm.tqdm(loader, desc=desc, leave=False):
+        views, _, image_ids = batch if len(batch) == 3 else (*batch, None)
+        views = views.to(device, non_blocking=True)
+        image_ids = image_ids.to(device, non_blocking=True) if image_ids is not None else None
+        loss, logs = lejepa_loss(
+            encoder(views), sigreg, num_cameras, lam, pred_loss_mode, scale_weights, image_ids
+        )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        encoder.clamp_gem_parameters()
         for key, value in logs.items():
             totals[key] += float(value.cpu())
         n_batches += 1
+        global_step += 1
+        if cfg and global_step % cfg.log_every_n_steps == 0:
+            print(f"step={global_step} " + " ".join(f"{name}.p={value:.3f}"
+                  for name, value in encoder.p_values().items()))
+        if cfg and global_step % cfg.debug_every_n_steps == 0:
+            debug_path = cfg.output_dir / "debug" / f"p3_activation_step_{global_step:07d}.png"
+            save_activation_debug_grid(encoder, views, debug_path)
     return {key: value / max(1, n_batches) for key, value in totals.items()}
+
+
+@torch.no_grad()
+def save_activation_debug_grid(encoder: YOLOv8GAPEncoder, views: torch.Tensor, output_path: Path,
+                               max_views: int = 4) -> Path:
+    """Save source views with their P3 GeM activation-energy overlays."""
+    import matplotlib.pyplot as plt
+
+    was_training = encoder.training
+    encoder.eval()
+    images = views.flatten(0, 1)[:max_views]
+    maps = encoder.backbone(images)["P3"]
+    pooler = encoder.poolers["P3"] if "P3" in encoder.poolers else None
+    exponent = float(pooler.p_value) if isinstance(pooler, GeM) else 1.0
+    energy = maps.clamp_min(1e-6).pow(exponent).mean(dim=1, keepdim=True)
+    energy = F.interpolate(energy, size=images.shape[-2:], mode="bilinear", align_corners=False)[:, 0]
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(len(images), 1, figsize=(7, 3 * len(images)), squeeze=False)
+    for i, (image, heatmap) in enumerate(zip(images, energy)):
+        rgb = image.detach().cpu().permute(1, 2, 0).numpy()
+        rgb = np.clip(rgb * np.asarray(IMAGENET_STD) + np.asarray(IMAGENET_MEAN), 0, 1)
+        axes[i, 0].imshow(rgb)
+        axes[i, 0].imshow(heatmap.detach().cpu().numpy(), cmap="magma", alpha=0.45)
+        axes[i, 0].axis("off")
+        axes[i, 0].set_title(f"P3 channel mean(x^{exponent:.2f})")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120)
+    plt.close(fig)
+    encoder.train(was_training)
+    return output_path
 
 
 def pretrain(
@@ -1238,14 +1475,18 @@ def pretrain(
     torch.manual_seed(cfg.seed)
     device = select_device(cfg.device)
     loader = loader or build_pretraining_loader(cfg, verbose)
-    encoder = YOLOv8GAPEncoder(cfg.model_cfg, cfg.proj_dim, cfg.hidden_dim).to(device)
+    encoder = YOLOv8GAPEncoder(
+        cfg.model_cfg, cfg.proj_dim, cfg.hidden_dim, cfg.pooling, cfg.gem,
+        cfg.pretrain_neck, cfg.scale_weights,
+    ).to(device)
     sigreg = SIGReg(cfg.sigreg_knots, cfg.sigreg_slices).to(device)
     optimizer = torch.optim.AdamW(encoder.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     records = []
     for epoch in range(cfg.epochs):
         stats = train_one_epoch(encoder, loader, sigreg, optimizer, len(cfg.cameras), cfg.lam, device,
-                                desc=f"Epoch {epoch + 1}/{cfg.epochs}", pred_loss_mode=cfg.pred_loss_mode)
+                                desc=f"Epoch {epoch + 1}/{cfg.epochs}", pred_loss_mode=cfg.prediction_pairing,
+                                scale_weights=cfg.scale_weights, cfg=cfg, global_step=epoch * len(loader))
         records.append({"epoch": epoch + 1, **stats})
         if verbose:
             print(f"Epoch {epoch + 1:03d} | " + " | ".join(f"{k}={v:.5f}" for k, v in stats.items()))
@@ -1341,11 +1582,12 @@ def export_backbone_to_yolo(
     backbone: YOLOv8MultiScaleBackbone,
     output_path: Path,
     model_cfg: str = EMPTY_MODEL_CFG,
+    transfer: str = "backbone",
 ) -> Path:
-    """Write an Ultralytics checkpoint whose layers 0-9 come from ``backbone``.
+    """Write an Ultralytics checkpoint with pretrained backbone and optional neck.
 
-    The neck and head keep the empty (random) initialisation of
-    ``model_cfg``. Saving a real ``.pt`` checkpoint is required because
+    The Detect head keeps the empty (random) initialisation of ``model_cfg``.
+    Saving a real ``.pt`` checkpoint is required because
     ``YOLO("*.yaml").train()`` rebuilds the model from scratch and would
     silently discard weights copied into it in memory.
 
@@ -1357,15 +1599,29 @@ def export_backbone_to_yolo(
         Destination ``.pt`` file.
     model_cfg : str, default="yolov8n.yaml"
         Architecture of the exported detector.
+    transfer : {"backbone", "backbone+neck"}, default="backbone"
+        Layers copied from the pretraining encoder.
 
     Returns
     -------
     pathlib.Path
         The written checkpoint, loadable with ``YOLO(path)``.
     """
+    if transfer not in TRANSFER_MODES:
+        raise ValueError(f"transfer must be one of {TRANSFER_MODES}, got '{transfer}'.")
     detection_model = YOLO(str(model_cfg)).model
-    target = nn.ModuleList(list(detection_model.model[: len(backbone.layers)]))
-    target.load_state_dict(backbone.layers.state_dict())
+    num_layers = YOLOv8MultiScaleBackbone.NUM_LAYERS if transfer == "backbone" else len(backbone.layers)
+    if num_layers > len(backbone.layers) or num_layers >= len(detection_model.model):
+        raise ValueError("Requested transfer layers are not available in the pretrained or target model.")
+    source = nn.ModuleList(list(backbone.layers[:num_layers])).state_dict()
+    target = nn.ModuleList(list(detection_model.model[:num_layers]))
+    target_keys = target.state_dict()
+    matched = sorted(set(source) & set(target_keys))
+    missing = sorted(set(target_keys) - set(source))
+    unexpected = sorted(set(source) - set(target_keys))
+    print(f"Export key match ({transfer}): matched={len(matched)}, "
+          f"missing={len(missing)}, unexpected={len(unexpected)}")
+    target.load_state_dict(source, strict=True)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -1373,5 +1629,6 @@ def export_backbone_to_yolo(
         "train_args": {},
         "date": datetime.now().isoformat(),
         "version": ultralytics.__version__,
+        "transfer": transfer,
     }, output_path)
     return output_path

@@ -50,6 +50,7 @@ from .core_pretraining import (
     export_backbone_to_yolo,
     list_images,
     load_backbone,
+    read_pretrain_config,
     load_rgb,
     select_device,
     validate_image_size,
@@ -535,6 +536,10 @@ class DetectionEvalConfig:
         Weight decay.
     freeze : int or None, default=None
         Number of leading layers to freeze (``10`` freezes the backbone).
+    freeze_backbone_epochs : int, default=0
+        Freeze the backbone for this many initial epochs, then unfreeze it.
+    backbone_lr_mult : float, default=1.0
+        Multiplier applied to the backbone learning rate.
     close_mosaic : int, default=10
         Epochs at the end without mosaic augmentation.
     patience : int, default=20
@@ -569,6 +574,8 @@ class DetectionEvalConfig:
     lrf: float = 0.01
     weight_decay: float = 1e-4
     freeze: Optional[int] = None
+    freeze_backbone_epochs: int = 0
+    backbone_lr_mult: float = 1.0
     close_mosaic: int = 10
     patience: int = 20
     workers: int = 0
@@ -583,6 +590,8 @@ class DetectionEvalConfig:
         self.output_dir = Path(self.output_dir)
         self.variants = tuple(validate_variant(v) for v in self.variants)
         validate_image_size(self.image_size)
+        if self.freeze_backbone_epochs < 0 or self.backbone_lr_mult <= 0:
+            raise ValueError("freeze_backbone_epochs must be non-negative and backbone_lr_mult must be positive.")
 
     @property
     def split_dir(self) -> Path:
@@ -632,15 +641,21 @@ def detection_init_weights(variant: str, sources: WeightSources, export_dir: Pat
     if variant == "scratch":
         return str(sources.model_cfg)
     backbone = build_backbone_for_variant(variant, sources)
-    init_path = export_backbone_to_yolo(backbone, Path(export_dir) / f"{name or variant}_init.pt", sources.model_cfg)
-    max_diff = verify_backbone_transfer(init_path, backbone)
+    pretrain_cfg = read_pretrain_config(sources.lejepa_checkpoint)
+    transfer = pretrain_cfg.get("transfer", "backbone")
+    init_path = export_backbone_to_yolo(
+        backbone, Path(export_dir) / f"{name or variant}_init.pt", sources.model_cfg, transfer=transfer
+    )
+    transferred_layers = 10 if transfer == "backbone" else len(backbone.layers)
+    max_diff = verify_backbone_transfer(init_path, backbone, transferred_layers)
     if max_diff != 0.0:
         raise RuntimeError(f"Backbone transfer for '{variant}' failed: max |difference| = {max_diff:.3e}")
-    print(f"[{name or variant}] backbone layers 0-{len(backbone.layers) - 1} verified in {init_path}")
+    print(f"[{name or variant}] layers 0-{transferred_layers - 1} verified in {init_path}")
     return str(init_path)
 
 
-def verify_backbone_transfer(init_weights: Path, backbone: YOLOv8MultiScaleBackbone) -> float:
+def verify_backbone_transfer(init_weights: Path, backbone: YOLOv8MultiScaleBackbone,
+                             num_layers: Optional[int] = None) -> float:
     """Measure how exactly a detector checkpoint reproduces a backbone.
 
     Every tensor of ``backbone`` (weights, biases and BatchNorm statistics)
@@ -665,9 +680,10 @@ def verify_backbone_transfer(init_weights: Path, backbone: YOLOv8MultiScaleBackb
     KeyError
         If the two state dictionaries do not have the same keys.
     """
-    source = backbone.layers.state_dict()
+    num_layers = num_layers or len(backbone.layers)
+    source = nn.ModuleList(list(backbone.layers[:num_layers])).state_dict()
     detector = YOLO(str(init_weights)).model
-    target = nn.ModuleList(list(detector.model[: len(backbone.layers)])).state_dict()
+    target = nn.ModuleList(list(detector.model[:num_layers])).state_dict()
     if source.keys() != target.keys():
         raise KeyError("Backbone and detector layer keys differ.")
     return max(float((source[k].float().cpu() - target[k].float().cpu()).abs().max()) for k in source)
@@ -808,6 +824,42 @@ def record_initialisation(trainer, *, variant: str, coco_state: Dict[str, torch.
     check_initialisation(variant, shares)
 
 
+def set_backbone_lr_multiplier(trainer, multiplier: float) -> None:
+    model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+    backbone_ids = {id(param) for layer in model.model[:10] for param in layer.parameters()}
+    optimizer = trainer.optimizer
+    for group in list(optimizer.param_groups):
+        backbone, other = [], []
+        for param in group["params"]:
+            (backbone if id(param) in backbone_ids else other).append(param)
+        if not backbone:
+            continue
+        if other:
+            group["params"] = other
+            backbone_group = {key: value for key, value in group.items() if key != "params"}
+            backbone_group["params"] = backbone
+            optimizer.add_param_group(backbone_group)
+            group = optimizer.param_groups[-1]
+        group["lr"] *= multiplier
+        if "initial_lr" in group:
+            group["initial_lr"] *= multiplier
+    scheduler = getattr(trainer, "scheduler", None)
+    if scheduler is not None and hasattr(scheduler, "base_lrs"):
+        scheduler.base_lrs = [group.get("initial_lr", group["lr"]) for group in optimizer.param_groups]
+        if hasattr(scheduler, "lr_lambdas") and scheduler.lr_lambdas:
+            scheduler.lr_lambdas.extend([scheduler.lr_lambdas[-1]] *
+                                        (len(optimizer.param_groups) - len(scheduler.lr_lambdas)))
+
+
+def apply_backbone_freeze_warmup(trainer, freeze_epochs: int) -> None:
+    model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+    frozen = int(trainer.epoch) < freeze_epochs
+    for layer in model.model[:10]:
+        layer.requires_grad_(not frozen)
+        if frozen:
+            layer.eval()
+
+
 def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConfig,
                       run_name: str, device: str,
                       coco_state: Optional[Dict[str, torch.Tensor]] = None,
@@ -846,6 +898,10 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
     """
     model = YOLO(init_weights)
     init_report: Dict[str, float] = {}
+    model.add_callback("on_train_start", partial(set_backbone_lr_multiplier,
+                                                 multiplier=cfg.backbone_lr_mult))
+    model.add_callback("on_train_epoch_start", partial(apply_backbone_freeze_warmup,
+                                                        freeze_epochs=cfg.freeze_backbone_epochs))
     if coco_state is not None:
         model.add_callback("on_train_start", partial(record_initialisation, variant=audit_variant or run_name,
                                                      coco_state=coco_state, report=init_report))
@@ -891,7 +947,8 @@ def validate_detector(weights: Path, data_yaml: Path, cfg: DetectionEvalConfig,
     )
     box = metrics.box
     return {"precision": float(box.mp), "recall": float(box.mr),
-            "mAP50": float(box.map50), "mAP50-95": float(box.map)}
+            "mAP50": float(box.map50), "mAP50-95": float(box.map),
+            "mAP75": float(box.all_ap[:, 5].mean()) if getattr(box, "all_ap", None) is not None else float("nan")}
 
 
 BOX_COLUMNS = ("image_id", "status", "class", "confidence", "iou",
@@ -1589,9 +1646,10 @@ def extract_embeddings(model: nn.Module, loader: DataLoader,
     model.eval()
     device = next(model.parameters()).device
     features, labels = [], []
-    for index, (images, targets) in enumerate(loader):
+    for index, batch in enumerate(loader):
         if max_batches is not None and index >= max_batches:
             break
+        images, targets = batch[:2]
         if images.dim() == 5:
             images, targets = images.flatten(0, 1), targets.flatten()
         features.append(model.embed(images.to(device)).cpu().numpy())

@@ -31,7 +31,11 @@ from .core_evaluation import (
     verify_backbone_transfer,
 )
 from .core_pretraining import (
+    GeM,
+    GeMConfig,
     PretrainConfig,
+    RandomRotationReflect,
+    RotationConfig,
     SIGReg,
     YOLOv8GAPEncoder,
     YOLOv8MultiScaleBackbone,
@@ -56,15 +60,20 @@ from .pipeline import (
     run_pretraining,
     run_probe_evaluation,
 )
+from .predict_video import predict_video
 
 __version__ = "0.1.0"
 
 __all__ = [
     "VARIANTS",
     "DetectionEvalConfig",
+    "GeM",
+    "GeMConfig",
     "LinearProbe",
     "PretrainConfig",
     "ProbeEvalConfig",
+    "RandomRotationReflect",
+    "RotationConfig",
     "SIGReg",
     "WeightSources",
     "YOLOv8GAPEncoder",
@@ -94,5 +103,6 @@ __all__ = [
     "save_encoder",
     "select_device",
     "verify_backbone_transfer",
+    "predict_video",
     "__version__",
 ]
