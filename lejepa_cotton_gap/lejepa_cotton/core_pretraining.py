@@ -1,4 +1,4 @@
-"""LeJEPA pretraining of a YOLOv8 backbone with global average pooling.
+"""LeJEPA pretraining of YOLOv8 backbone and neck features.
 
 Two prediction-loss variants are available (``pred_loss_mode``): the original
 ``"cross_camera"`` loss and the ``"intra_image"`` loss that compares two mild
@@ -75,8 +75,8 @@ class RotationConfig:
     p: float = 0.5
 
     def __post_init__(self) -> None:
-        if self.max_deg < 0 or not 0.0 <= self.p <= 1.0:
-            raise ValueError("rotation.max_deg must be non-negative and rotation.p must lie in [0, 1].")
+        if not 0 <= self.max_deg <= 15 or not 0.0 <= self.p <= 1.0:
+            raise ValueError("rotation.max_deg must be in [0, 15] and rotation.p must lie in [0, 1].")
 
 
 # --------------------------------------------------------------------------- #
@@ -84,7 +84,7 @@ class RotationConfig:
 # --------------------------------------------------------------------------- #
 @dataclass
 class PretrainConfig:
-    """Hyper-parameters and paths for cross-camera GAP LeJEPA pretraining.
+    """Hyper-parameters and paths for LeJEPA pretraining.
 
     Parameters
     ----------
@@ -121,8 +121,8 @@ class PretrainConfig:
         ``lambdas``.
     lambdas : tuple of float, default=(0.1, 0.2, 0.3, 0.4, 0.5)
         SIGReg weights pretrained one after another by the lambda sweep.
-    pred_loss_mode : {"cross_camera", "intra_image"}, default="cross_camera"
-        Which prediction loss is used (see :func:`prediction_loss`).
+    pred_loss_mode : {"cross_camera", "intra_image"} or None
+        Compatibility alias for ``prediction_pairing``.
     pooling : {"gem", "gap"}, default="gem"
         Spatial pooling applied independently to each selected scale.
     pool_cameras : tuple of int, default=(1, 2, 5, 6)
@@ -478,6 +478,8 @@ class RandomRotationReflect:
     """Sample an independent, reflect-padded rotation for each transformed view."""
 
     def __init__(self, max_deg: float = 15.0, p: float = 0.5, enabled: bool = True) -> None:
+        if not 0 <= max_deg <= 15 or not 0 <= p <= 1:
+            raise ValueError("Rotation must use max_deg in [0, 15] and p in [0, 1].")
         self.max_deg = float(max_deg)
         self.p = float(p)
         self.enabled = bool(enabled)
@@ -499,11 +501,10 @@ class RandomRotationReflect:
 
 
 def build_train_transform(image_size: int, rotation: Optional[RotationConfig] = None) -> v2.Compose:
-    """Resize and randomly flip every camera view independently.
+    """Resize and augment every camera view independently.
 
-    Flips provide orientation variation while preserving the full cotton
-    canopy and image contents. No rotation, crop, translation, or colour
-    augmentation is applied during pretraining.
+    Rotations use reflect padding so image corners do not reveal augmentation
+    labels. Color changes are not applied during pretraining.
 
     Parameters
     ----------
@@ -515,6 +516,8 @@ def build_train_transform(image_size: int, rotation: Optional[RotationConfig] = 
     torchvision.transforms.v2.Compose
         PIL image to normalised ``float32`` tensor pipeline.
     """
+    if isinstance(rotation, dict):
+        rotation = RotationConfig(**rotation)
     rotation = rotation or RotationConfig(enabled=False)
     return v2.Compose([
         v2.Resize((image_size, image_size)),
@@ -644,13 +647,10 @@ def discover_image_pool(root: Path, cameras: Sequence[int],
 
 def build_geometric_views(image: Image.Image, image_size: int, global_scale: Tuple[float, float] = (0.4, 1.0),
                           rotation: Optional[RotationConfig] = None) -> torch.Tensor:
-    """Create two randomly flipped views of one image, without rotation.
+    """Create two independently augmented global views of one image.
 
-    The image is resized to the model input size, then independent horizontal
-    and vertical flips (each with probability 0.5) create the first view.
-    The second view is formed by applying a randomly selected horizontal,
-    vertical, or combined flip to the first. This keeps all pixels in-frame
-    and avoids rotation interpolation, crops, and colour changes.
+    Each view samples a large global crop, independent flips, and an optional
+    reflect-padded rotation. This retains most of the source image content.
 
     Parameters
     ----------
@@ -664,6 +664,8 @@ def build_geometric_views(image: Image.Image, image_size: int, global_scale: Tup
     torch.Tensor
         Normalised views of shape ``(2, 3, image_size, image_size)``.
     """
+    if isinstance(rotation, dict):
+        rotation = RotationConfig(**rotation)
     rotation = rotation or RotationConfig(enabled=False)
     transform = v2.Compose([
         v2.RandomResizedCrop((image_size, image_size), scale=global_scale),
@@ -756,7 +758,7 @@ def make_loader(dataset: Dataset, cfg: PretrainConfig) -> DataLoader:
 
 
 def build_pretraining_dataset(cfg: PretrainConfig, verbose: bool = True) -> Dataset:
-    """Create the dataset matching ``cfg.pred_loss_mode``.
+    """Create the dataset matching ``cfg.prediction_pairing``.
 
     Parameters
     ----------
@@ -787,7 +789,7 @@ def build_pretraining_dataset(cfg: PretrainConfig, verbose: bool = True) -> Data
 
 
 def build_pretraining_loader(cfg: PretrainConfig, verbose: bool = True) -> DataLoader:
-    """Create the shuffled DataLoader matching ``cfg.pred_loss_mode``.
+    """Create the shuffled DataLoader matching ``cfg.prediction_pairing``.
 
     Parameters
     ----------
@@ -1231,25 +1233,23 @@ def assert_image_groups(image_ids: Optional[torch.Tensor], batch: int, num_views
 def intra_image_prediction_loss(z: torch.Tensor, image_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Variant 2 of ``L_pred``: compare two geometric views of one image.
 
-    Both views are augmented copies of the *same* image (random flips only,
-    see :func:`build_geometric_views`), so the embedding is pulled toward
-    invariance to those reflections. The distance is the same
-    mean squared error as in :func:`cross_camera_prediction_loss`.
+    All views are augmented copies of the *same* image. Each view is compared
+    with that source image's mean embedding, never with another source image.
 
     Parameters
     ----------
     z : torch.Tensor
-        Shape ``(B, 2, D)``: view 0 and view 1 of each image.
+        Shape ``(B, V, D)``: all view embeddings of each source image.
 
     Returns
     -------
     torch.Tensor
-        Scalar mean squared error between the two views' embeddings.
+        Scalar mean squared error between each view and its group's mean.
 
     Raises
     ------
     ValueError
-        If ``z`` does not hold exactly two views per image.
+        If ``z`` does not hold at least two views per image.
     """
     if z.dim() != 3 or z.shape[1] < 2:
         raise ValueError(f"intra-image loss needs shape (B, V>=2, D), got {tuple(z.shape)}.")

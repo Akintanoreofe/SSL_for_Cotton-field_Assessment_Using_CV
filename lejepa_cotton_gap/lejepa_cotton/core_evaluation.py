@@ -3,8 +3,8 @@
 Two protocols are provided, both parameterised by a *variant* name:
 
 ``"lejepa"``
-    Backbone from the cross-camera GAP LeJEPA checkpoint (empty-weight
-    ``yolov8n.yaml`` before pretraining); neck and head random.
+    Backbone from a LeJEPA checkpoint, with neck transfer controlled by its
+    saved pretraining configuration; the Detect head remains random.
 ``"coco"``
     Official ``yolov8n.pt`` COCO weights (backbone, neck and head).
 ``"coco_backbone"``
