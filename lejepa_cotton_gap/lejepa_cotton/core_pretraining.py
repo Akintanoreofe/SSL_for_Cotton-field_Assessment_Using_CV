@@ -33,12 +33,12 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 import ultralytics
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import v2
 from ultralytics import YOLO
-from tqdm.auto import tqdm
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
