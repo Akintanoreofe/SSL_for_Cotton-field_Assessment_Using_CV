@@ -1498,7 +1498,11 @@ def pretrain(
     torch.manual_seed(cfg.seed)
     device = select_device(cfg.device)
     loader = build_pretraining_loader(cfg, verbose) if loader is None else loader
-    if len(loader) == 0:
+    try:
+        batches_per_epoch = len(loader)
+    except TypeError:
+        batches_per_epoch = None
+    if batches_per_epoch == 0:
         raise ValueError("Pretraining data loader contains no batches.")
     encoder = YOLOv8GAPEncoder(
         cfg.model_cfg, cfg.proj_dim, cfg.hidden_dim, cfg.pooling, cfg.gem,
@@ -1512,7 +1516,9 @@ def pretrain(
         stats = train_one_epoch(encoder, loader, sigreg, optimizer, len(cfg.cameras), cfg.lam, device,
                                 desc=f"Epoch {epoch + 1}/{cfg.epochs}",
                                 pred_loss_mode=cfg.prediction_pairing, scale_weights=cfg.scale_weights,
-                                cfg=cfg, global_step=epoch * len(loader))
+                                cfg=cfg, global_step=epoch * batches_per_epoch if batches_per_epoch else 0)
+        if not stats:
+            raise ValueError("Pretraining data loader yielded no batches.")
         stats.update({f"p_{name.lower()}": value for name, value in encoder.p_values().items()})
         records.append({"epoch": epoch + 1, **stats})
         if verbose:
