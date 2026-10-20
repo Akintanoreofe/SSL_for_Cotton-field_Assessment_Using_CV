@@ -1418,7 +1418,7 @@ def train_one_epoch(
         optimizer.step()
         encoder.clamp_gem_parameters()
         for key, value in logs.items():
-            value = value.detach()
+            value = torch.as_tensor(value, device=device).detach().float().reshape(())
             totals[key] = totals[key] + value if key in totals else value
         n_batches += 1
         global_step += 1

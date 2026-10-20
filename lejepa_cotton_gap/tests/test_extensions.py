@@ -56,7 +56,8 @@ def test_train_one_epoch_averages_metrics_without_per_step_output(monkeypatch, c
         encoder, loader, None, optimizer, 1, 0.2, torch.device("cpu")
     )
 
-    assert stats == {"total": 20.0}
+    # The batch losses are (2 * 1)^2 = 4 and (2 * 3)^2 = 36.
+    assert stats["total"] == pytest.approx(20.0)
     assert capsys.readouterr().out == ""
 
 
