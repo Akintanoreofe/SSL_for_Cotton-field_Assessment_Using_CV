@@ -1369,6 +1369,7 @@ def train_one_epoch(
     scale_weights: Optional[Dict[str, float]] = None,
     cfg: Optional[PretrainConfig] = None,
     global_step: int = 0,
+    step_counter: Optional[List[int]] = None,
 ) -> Dict[str, float]:
     """Run one optimisation pass over the loader.
 
@@ -1398,6 +1399,8 @@ def train_one_epoch(
         to zero so they are disabled unless explicitly enabled.
     global_step : int, default=0
         Starting step index for optional diagnostics.
+    step_counter : list of int or None, default=None
+        Optional mutable step state updated after every batch.
 
     Returns
     -------
@@ -1424,6 +1427,11 @@ def train_one_epoch(
             totals[key] = totals[key] + value if key in totals else value
         n_batches += 1
         global_step += 1
+        if step_counter is not None:
+            if step_counter:
+                step_counter[0] = global_step
+            else:
+                step_counter.append(global_step)
         if cfg and cfg.log_every_n_steps and global_step % cfg.log_every_n_steps == 0:
             label = f"{desc} " if desc else ""
             print(f"{label}step={global_step} " + " ".join(f"{name}.p={value:.3f}"
@@ -1512,11 +1520,12 @@ def pretrain(
     optimizer = torch.optim.AdamW(encoder.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     records = []
+    step_counter = [0]
     for epoch in range(cfg.epochs):
         stats = train_one_epoch(encoder, loader, sigreg, optimizer, len(cfg.cameras), cfg.lam, device,
                                 desc=f"Epoch {epoch + 1}/{cfg.epochs}",
                                 pred_loss_mode=cfg.prediction_pairing, scale_weights=cfg.scale_weights,
-                                cfg=cfg, global_step=epoch * batches_per_epoch if batches_per_epoch else 0)
+                                cfg=cfg, global_step=step_counter[0], step_counter=step_counter)
         if not stats:
             raise ValueError("Pretraining data loader yielded no batches.")
         stats.update({f"p_{name.lower()}": value for name, value in encoder.p_values().items()})

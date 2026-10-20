@@ -95,6 +95,23 @@ def test_pretrain_rejects_empty_loader(tmp_path):
         core_pretraining.pretrain(cfg, loader=loader, verbose=False)
 
 
+def test_pretrain_rejects_empty_unsized_loader(monkeypatch, tmp_path):
+    class EmptyIterableDataset(torch.utils.data.IterableDataset):
+        def __iter__(self):
+            return iter(())
+
+    monkeypatch.setattr(
+        core_pretraining,
+        "YOLOv8GAPEncoder",
+        lambda *_args, **_kwargs: torch.nn.Linear(1, 1),
+    )
+    cfg = PretrainConfig(image_root=tmp_path, output_dir=tmp_path, epochs=1)
+    loader = torch.utils.data.DataLoader(EmptyIterableDataset())
+
+    with pytest.raises(ValueError, match="yielded no batches"):
+        core_pretraining.pretrain(cfg, loader=loader, verbose=False)
+
+
 def test_train_one_epoch_enables_step_diagnostics_when_configured(monkeypatch, capsys, tmp_path):
     class Encoder(torch.nn.Module):
         def __init__(self):
