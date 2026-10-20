@@ -164,6 +164,7 @@ def test_train_one_epoch_enables_step_diagnostics_when_configured(monkeypatch, c
     assert "train step=1 P3.p=2.000" in output
     assert "train step=2 P3.p=2.000" in output
     assert len(debug_paths) == 2
+    assert debug_paths[0].name == "p3_activation_train_step_0000001.png"
 
 
 def test_gem_p_one_matches_gap_and_handles_negative_inputs():
