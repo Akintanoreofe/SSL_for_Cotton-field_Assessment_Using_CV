@@ -66,7 +66,7 @@ COCO_MODEL_NAME = "coco_backbone"
 
 
 def default_pca_epochs(epochs: int) -> Set[int]:
-    """Zero-based epochs at which pretraining embeddings are visualised.
+    """Return no PCA epochs by default to avoid slowing down pretraining.
 
     Parameters
     ----------
@@ -76,9 +76,9 @@ def default_pca_epochs(epochs: int) -> Set[int]:
     Returns
     -------
     set of int
-        First, middle and last epoch.
+        Empty set; pass ``pca_epochs`` to :func:`run_pretraining` to opt in.
     """
-    return {0, epochs // 2, epochs - 1}
+    return set()
 
 
 def log_pretraining_pca(epoch: int, encoder: YOLOv8GAPEncoder, loader: DataLoader, *,

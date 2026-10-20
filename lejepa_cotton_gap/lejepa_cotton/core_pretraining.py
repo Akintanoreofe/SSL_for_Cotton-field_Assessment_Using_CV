@@ -1356,7 +1356,6 @@ def train_one_epoch(
     num_cameras: int,
     lam: float,
     device: torch.device,
-    desc: str = "",
     pred_loss_mode: str = "cross_camera",
     scale_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
@@ -1378,8 +1377,6 @@ def train_one_epoch(
         SIGReg weight.
     device : torch.device
         Compute device.
-    desc : str, default=""
-        Progress-bar label.
     pred_loss_mode : {"cross_camera", "intra_image"}, default="cross_camera"
         Prediction-loss variant.
 
@@ -1403,7 +1400,10 @@ def train_one_epoch(
         optimizer.step()
         encoder.clamp_gem_parameters()
         for key, value in logs.items():
-            totals[key] = totals.get(key, torch.zeros_like(value)) + value
+            if key in totals:
+                totals[key] += value
+            else:
+                totals[key] = value.clone()
         n_batches += 1
     if not totals:
         return {}
@@ -1482,8 +1482,7 @@ def pretrain(
     records = []
     for epoch in range(cfg.epochs):
         stats = train_one_epoch(encoder, loader, sigreg, optimizer, len(cfg.cameras), cfg.lam, device,
-                                desc=f"Epoch {epoch + 1}/{cfg.epochs}", pred_loss_mode=cfg.prediction_pairing,
-                                scale_weights=cfg.scale_weights)
+                                pred_loss_mode=cfg.prediction_pairing, scale_weights=cfg.scale_weights)
         stats.update({f"p_{name.lower()}": value for name, value in encoder.p_values().items()})
         records.append({"epoch": epoch + 1, **stats})
         if verbose:

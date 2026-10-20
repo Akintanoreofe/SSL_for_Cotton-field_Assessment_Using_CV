@@ -6,6 +6,7 @@ import pytest
 import torch
 from ultralytics import YOLO
 
+from lejepa_cotton import core_pretraining
 from lejepa_cotton import (
     GeM,
     PretrainConfig,
@@ -21,6 +22,42 @@ from lejepa_cotton import (
     lejepa_loss,
     predict_video,
 )
+
+
+def test_train_one_epoch_averages_metrics_without_per_step_output(monkeypatch, capsys):
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(2.0))
+
+        def forward(self, views):
+            return {"feature": self.weight * views.mean()}
+
+        def clamp_gem_parameters(self):
+            pass
+
+    def fake_lejepa_loss(projections, *_args):
+        loss = projections["feature"].square()
+        return loss, {"total": loss.detach()}
+
+    monkeypatch.setattr(core_pretraining, "lejepa_loss", fake_lejepa_loss)
+    encoder = Encoder()
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(
+            torch.tensor([[[1.0]], [[3.0]]]),
+            torch.zeros(2, dtype=torch.long),
+            torch.zeros(2, dtype=torch.long),
+        ),
+        batch_size=1,
+    )
+    optimizer = torch.optim.SGD(encoder.parameters(), lr=0)
+
+    stats = core_pretraining.train_one_epoch(
+        encoder, loader, None, optimizer, 1, 0.2, torch.device("cpu")
+    )
+
+    assert stats == {"total": 20.0}
+    assert capsys.readouterr().out == ""
 
 
 def test_gem_p_one_matches_gap_and_handles_negative_inputs():
