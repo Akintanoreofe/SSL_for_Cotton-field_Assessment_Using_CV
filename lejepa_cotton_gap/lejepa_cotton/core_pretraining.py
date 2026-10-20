@@ -1401,7 +1401,8 @@ def train_one_epoch(
     Returns
     -------
     dict of str to float
-        Epoch-averaged loss components.
+        Epoch-averaged loss components, or an empty dictionary when the loader
+        yields no batches.
     """
     encoder.train()
     totals: Dict[str, torch.Tensor] = {}
