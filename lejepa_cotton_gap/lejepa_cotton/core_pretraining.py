@@ -548,10 +548,10 @@ def discover_image_pool(root: Path, cameras: Sequence[int],
 def build_geometric_views(image: Image.Image, image_size: int, max_rotation_deg: float = 15.0) -> torch.Tensor:
     """Create two mildly augmented views of one image.
 
-    Each view is resized to a square and then independently receives a
-    horizontal flip (p=0.5), a vertical flip (p=0.5) and a random rotation in
-    ``[-max_rotation_deg, +max_rotation_deg]``. There are no crops,
-    perspective warps or colour changes, so the objects stay recognisable.
+    View 1 is resized to a square, then receives a horizontal flip (p=0.5), a
+    vertical flip (p=0.5) and a random rotation in
+    ``[-max_rotation_deg, +max_rotation_deg]``. View 2 is derived from View 1
+    by a randomly chosen horizontal, vertical or combined flip.
 
     Parameters
     ----------
@@ -576,7 +576,13 @@ def build_geometric_views(image: Image.Image, image_size: int, max_rotation_deg:
         v2.ToDtype(torch.float32, scale=True),
         v2.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
-    return torch.stack([transform(image), transform(image)])
+    view1 = transform(image)
+    # View 2 is View 1 itself (same crop, after its augmentations) with a random
+    # flip: horizontal, vertical or both. Flips keep every pixel filled and the
+    # shape unchanged. (For rotations, use only torch.rot90 multiples of 90 deg.)
+    dims = [[-1], [-2], [-2, -1]][int(torch.randint(3, (1,)))]
+    view2 = torch.flip(view1, dims)
+    return torch.stack([view1, view2])
 
 
 class ImagePoolDataset(Dataset):
