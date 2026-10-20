@@ -1,6 +1,6 @@
 # SSL for Cotton Field Assessment Using Computer Vision
 
-This repository contains a self-supervised learning pipeline for cotton imagery. It pretrains a YOLOv8n backbone with cross-camera LeJEPA, then evaluates the learned features on cotton-boll detection and plot-status classification.
+This repository contains a self-supervised learning pipeline for cotton imagery. It pretrains YOLOv8n with LeJEPA (learnable GeM and neck/P3 pretraining by default, with a legacy GAP mode), then evaluates the learned features on cotton-boll detection and plot-status classification.
 
 ## Start here
 
@@ -23,8 +23,8 @@ Alternatively, open [`run_gap_lejepa_pipeline.ipynb`](lejepa_cotton_gap/notebook
 
 ## Pipeline overview
 
-1. **Pretraining:** learns multi-scale GAP features from synchronized camera views, with cross-camera and intra-image prediction-loss options and a lambda-sweep runner.
-2. **Cotton-boll detection:** fine-tunes and compares LeJEPA, COCO-pretrained, COCO-backbone-only, and randomly initialized YOLOv8 variants.
+1. **Pretraining:** learns GeM- or GAP-pooled backbone/neck features with configurable intra-image or cross-camera pairing and scale weights.
+2. **Cotton-boll detection:** fine-tunes and compares LeJEPA, COCO-pretrained, COCO-backbone-only, and randomly initialized YOLOv8 variants; evaluation reports AP50, AP50-95 and AP75.
 3. **Plot-status classification:** trains a linear probe on frozen backbone features and reports classification metrics.
 
 The package requires Python 3.9 or newer. The default input size is 640 and must be a multiple of 32. Use absolute paths for dataset and output locations, especially in notebooks.

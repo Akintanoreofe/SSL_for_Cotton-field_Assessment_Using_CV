@@ -31,14 +31,21 @@ from .core_evaluation import (
     verify_backbone_transfer,
 )
 from .core_pretraining import (
+    GeM,
+    GeMConfig,
     PretrainConfig,
+    RandomRotationReflect,
+    RotationConfig,
     SIGReg,
     YOLOv8GAPEncoder,
     YOLOv8MultiScaleBackbone,
     build_geometric_views,
+    assert_image_groups,
     cross_camera_prediction_loss,
     discover_camera_groups,
     intra_image_prediction_loss,
+    global_average_pool,
+    lejepa_loss,
     lambda_artifact_paths,
     export_backbone_to_yolo,
     load_backbone,
@@ -56,15 +63,20 @@ from .pipeline import (
     run_pretraining,
     run_probe_evaluation,
 )
+from .predict_video import predict_video
 
 __version__ = "0.1.0"
 
 __all__ = [
     "VARIANTS",
     "DetectionEvalConfig",
+    "GeM",
+    "GeMConfig",
     "LinearProbe",
     "PretrainConfig",
     "ProbeEvalConfig",
+    "RandomRotationReflect",
+    "RotationConfig",
     "SIGReg",
     "WeightSources",
     "YOLOv8GAPEncoder",
@@ -72,8 +84,11 @@ __all__ = [
     "build_backbone_for_variant",
     "classification_summary",
     "build_geometric_views",
+    "assert_image_groups",
     "cross_camera_prediction_loss",
     "intra_image_prediction_loss",
+    "global_average_pool",
+    "lejepa_loss",
     "lambda_artifact_paths",
     "plot_lambda_losses",
     "run_lambda_evaluation",
@@ -94,5 +109,6 @@ __all__ = [
     "save_encoder",
     "select_device",
     "verify_backbone_transfer",
+    "predict_video",
     "__version__",
 ]

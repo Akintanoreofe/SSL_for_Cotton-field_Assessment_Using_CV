@@ -160,7 +160,7 @@ def save_pretraining_loss_curves(history: pd.DataFrame, out_path: Path) -> Path:
         The written file.
     """
     panels = {"Total LeJEPA loss": ["total"],
-              "Cross-camera prediction": sorted(c for c in history if c.startswith("pred")),
+              "Prediction loss": sorted(c for c in history if c.startswith("pred")),
               "SIGReg": sorted(c for c in history if c.startswith("sigreg"))}
     fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4))
     for ax, (title, columns) in zip(axes, panels.items()):
@@ -464,19 +464,19 @@ def save_pretraining_view_examples(cfg: PretrainConfig, out_path: Path, num_samp
     mean = np.array(IMAGENET_MEAN).reshape(3, 1, 1)
     std = np.array(IMAGENET_STD).reshape(3, 1, 1)
     fig, axes = plt.subplots(len(samples), num_views, figsize=(3.2 * num_views, 3.4 * len(samples)), squeeze=False)
-    for row, (views, camera_ids) in enumerate(samples):
+    for row, (views, camera_ids, _) in enumerate(samples):
         for col in range(num_views):
             image = np.clip(views[col].numpy() * std + mean, 0, 1).transpose(1, 2, 0)
             ax = axes[row, col]
             ax.imshow(image)
             ax.set_xticks([])
             ax.set_yticks([])
-            if cfg.pred_loss_mode == "intra_image":
+            if cfg.prediction_pairing == "intra_image":
                 ax.set_title(f"Sample {row + 1} | View {col + 1}\n(camera {int(camera_ids[col])}, "
-                             f"random flips)", fontsize=9)
+                             f"crop/flip/rotation)", fontsize=9)
             else:
                 ax.set_title(f"Sample {row + 1} | View {col + 1}\ncamera {int(camera_ids[col])}", fontsize=9)
-    fig.suptitle(f"Final views entering the encoder (mode: {cfg.pred_loss_mode}, "
+    fig.suptitle(f"Final views entering the encoder (mode: {cfg.prediction_pairing}, "
                  f"{cfg.image_size}x{cfg.image_size}, de-normalised for display).\n"
                  "The prediction loss pulls the embeddings of the views in each row together.",
                  fontsize=11)

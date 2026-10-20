@@ -12,7 +12,7 @@ from setuptools import find_packages, setup
 setup(
     name="lejepa-cotton",
     version="0.1.0",
-    description="Cross-camera GAP LeJEPA pretraining of YOLOv8 for cotton boll detection",
+    description="LeJEPA pretraining of YOLOv8 for cotton boll detection",
     long_description=Path(__file__).with_name("README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
     author="Akintan Oreofeoluwa",
