@@ -1389,7 +1389,7 @@ def train_one_epoch(
     device : torch.device
         Compute device.
     desc : str, default=""
-        Retained for compatibility; batch progress output is disabled.
+        Optional label prefix for explicitly enabled step diagnostics.
     pred_loss_mode : {"cross_camera", "intra_image"}, default="cross_camera"
         Prediction-loss variant.
     cfg : PretrainConfig or None, default=None
@@ -1419,14 +1419,12 @@ def train_one_epoch(
         encoder.clamp_gem_parameters()
         for key, value in logs.items():
             value = value.detach()
-            if key in totals:
-                totals[key] += value
-            else:
-                totals[key] = value.clone()
+            totals[key] = totals[key] + value if key in totals else value
         n_batches += 1
         global_step += 1
         if cfg and cfg.log_every_n_steps and global_step % cfg.log_every_n_steps == 0:
-            print(f"step={global_step} " + " ".join(f"{name}.p={value:.3f}"
+            label = f"{desc} " if desc else ""
+            print(f"{label}step={global_step} " + " ".join(f"{name}.p={value:.3f}"
                   for name, value in encoder.p_values().items()))
         if cfg and cfg.debug_every_n_steps and global_step % cfg.debug_every_n_steps == 0:
             debug_path = cfg.output_dir / "debug" / f"p3_activation_step_{global_step:07d}.png"
