@@ -100,8 +100,6 @@ class PretrainConfig:
     pool_cameras : tuple of int, default=(1, 2, 5, 6)
         Camera ids (as written in the file names) whose images form the pool
         of the ``"intra_image"`` mode.
-    max_rotation_deg : float, default=15.0
-        Largest absolute rotation of the ``"intra_image"`` views.
     overwrite : bool, default=False
         Retrain a lambda even when its checkpoint already exists.
     checkpoint_dir_name : str, default="checkpoints"
@@ -141,7 +139,6 @@ class PretrainConfig:
     lambdas: Tuple[float, ...] = DEFAULT_LAMBDAS
     pred_loss_mode: str = "cross_camera"
     pool_cameras: Tuple[int, ...] = (1, 2, 5, 6)
-    max_rotation_deg: float = 15.0
     overwrite: bool = False
     checkpoint_dir_name: str = "checkpoints"
     sigreg_knots: int = 17
@@ -408,7 +405,11 @@ def discover_camera_groups(
 # Augmentation and dataset
 # --------------------------------------------------------------------------- #
 def build_train_transform(image_size: int) -> v2.Compose:
-    """Geometric augmentation applied independently to every camera view.
+    """Resize and randomly flip every camera view independently.
+
+    Flips provide orientation variation while preserving the full cotton
+    canopy and image contents. No rotation, crop, translation, or colour
+    augmentation is applied during pretraining.
 
     Parameters
     ----------
@@ -421,11 +422,9 @@ def build_train_transform(image_size: int) -> v2.Compose:
         PIL image to normalised ``float32`` tensor pipeline.
     """
     return v2.Compose([
-        v2.RandomResizedCrop(image_size, scale=(0.5, 1.0), ratio=(0.9, 1.1)),
+        v2.Resize((image_size, image_size)),
         v2.RandomHorizontalFlip(0.5),
-        v2.RandomVerticalFlip(0.1),
-        v2.RandomRotation(25),
-        v2.RandomAffine(degrees=0, translate=(0.08, 0.08), scale=(0.85, 1.15)),
+        v2.RandomVerticalFlip(0.5),
         v2.ToImage(),
         v2.ToDtype(torch.float32, scale=True),
         v2.Normalize(IMAGENET_MEAN, IMAGENET_STD),
@@ -545,13 +544,14 @@ def discover_image_pool(root: Path, cameras: Sequence[int],
     return pool
 
 
-def build_geometric_views(image: Image.Image, image_size: int, max_rotation_deg: float = 15.0) -> torch.Tensor:
-    """Create two mildly augmented views of one image.
+def build_geometric_views(image: Image.Image, image_size: int) -> torch.Tensor:
+    """Create two randomly flipped views of one image, without rotation.
 
-    View 1 is resized to a square, then receives a horizontal flip (p=0.5), a
-    vertical flip (p=0.5) and a random rotation in
-    ``[-max_rotation_deg, +max_rotation_deg]``. View 2 is derived from View 1
-    by a randomly chosen horizontal, vertical or combined flip.
+    The image is resized to the model input size, then independent horizontal
+    and vertical flips (each with probability 0.5) create the first view.
+    The second view is formed by applying a randomly selected horizontal,
+    vertical, or combined flip to the first. This keeps all pixels in-frame
+    and avoids rotation interpolation, crops, and colour changes.
 
     Parameters
     ----------
@@ -559,8 +559,6 @@ def build_geometric_views(image: Image.Image, image_size: int, max_rotation_deg:
         RGB source image.
     image_size : int
         Output side length.
-    max_rotation_deg : float, default=15.0
-        Largest absolute rotation in degrees.
 
     Returns
     -------
@@ -571,15 +569,13 @@ def build_geometric_views(image: Image.Image, image_size: int, max_rotation_deg:
         v2.Resize((image_size, image_size)),
         v2.RandomHorizontalFlip(0.5),
         v2.RandomVerticalFlip(0.5),
-        v2.RandomRotation(max_rotation_deg),
         v2.ToImage(),
         v2.ToDtype(torch.float32, scale=True),
         v2.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
     view1 = transform(image)
-    # View 2 is View 1 itself (same crop, after its augmentations) with a random
-    # flip: horizontal, vertical or both. Flips keep every pixel filled and the
-    # shape unchanged. (For rotations, use only torch.rot90 multiples of 90 deg.)
+    # Derive a second view using an additional random reflection. The three
+    # equally likely choices preserve the full frame and its square dimensions.
     dims = [[-1], [-2], [-2, -1]][int(torch.randint(3, (1,)))]
     view2 = torch.flip(view1, dims)
     return torch.stack([view1, view2])
@@ -594,14 +590,11 @@ class ImagePoolDataset(Dataset):
         ``(path, camera_id)`` pairs from :func:`discover_image_pool`.
     image_size : int
         Side length of the views.
-    max_rotation_deg : float
-        Largest absolute rotation of a view.
     """
 
-    def __init__(self, pool: List[Tuple[Path, int]], image_size: int, max_rotation_deg: float) -> None:
+    def __init__(self, pool: List[Tuple[Path, int]], image_size: int) -> None:
         self.pool = pool
         self.image_size = image_size
-        self.max_rotation_deg = max_rotation_deg
 
     def __len__(self) -> int:
         """Return the number of images in the pool.
@@ -629,7 +622,7 @@ class ImagePoolDataset(Dataset):
             Shape ``(2,)``; the source camera repeated for both views.
         """
         path, camera = self.pool[idx]
-        views = build_geometric_views(load_rgb(path), self.image_size, self.max_rotation_deg)
+        views = build_geometric_views(load_rgb(path), self.image_size)
         return views, torch.full((2,), camera)
 
 
@@ -680,7 +673,7 @@ def build_pretraining_dataset(cfg: PretrainConfig, verbose: bool = True) -> Data
                          cfg.max_samples, cfg.seed)
         if verbose:
             print(f"Image pool from cameras {cfg.pool_cameras}: {len(pool)} images.")
-        return ImagePoolDataset(pool, cfg.image_size, cfg.max_rotation_deg)
+        return ImagePoolDataset(pool, cfg.image_size)
     groups = discover_camera_groups(cfg.image_root, cfg.cameras, cfg.filename_pattern)
     sampled = subsample(groups, cfg.max_samples, cfg.seed)
     if verbose:
