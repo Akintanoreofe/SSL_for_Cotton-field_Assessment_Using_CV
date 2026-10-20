@@ -1037,9 +1037,9 @@ def cross_camera_prediction_loss(z: torch.Tensor, num_cameras: int) -> torch.Ten
 def intra_image_prediction_loss(z: torch.Tensor) -> torch.Tensor:
     """Variant 2 of ``L_pred``: compare two geometric views of one image.
 
-    Both views are augmented copies of the *same* image (flips and small
-    rotations, see :func:`build_geometric_views`), so the embedding is pulled
-    toward invariance to those transformations. The distance is the same
+    Both views are augmented copies of the *same* image (random flips only,
+    see :func:`build_geometric_views`), so the embedding is pulled toward
+    invariance to those reflections. The distance is the same
     mean squared error as in :func:`cross_camera_prediction_loss`.
 
     Parameters

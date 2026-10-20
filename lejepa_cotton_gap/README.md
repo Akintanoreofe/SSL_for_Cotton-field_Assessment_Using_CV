@@ -57,7 +57,9 @@ Python ≥ 3.9, PyTorch ≥ 2.0, torchvision ≥ 0.16, Ultralytics ≥ 8.1.
 - *SIGReg*: a sliced Epps–Pulley test pushes the embedding distribution toward an isotropic Gaussian, which prevents collapse.
 - `loss = (1 − λ)·prediction + λ·SIGReg`, with λ = 0.2 by default.
 
-**How the losses are computed.** At each feature scale, the projector produces embeddings with shape `(batch, views, projection_dim)`. With `cross_camera`, views are grouped by camera; each camera's target is the mean embedding of the *other* cameras in the same frame, and the prediction term is the mean squared error from every view to its camera's target. With `intra_image`, the two independently flipped/rotated views of each image are compared directly with mean squared error. Both prediction losses encourage agreement, but across different sources of views.
+**Pretraining augmentation.** Images are resized to the model input size and augmented only with random horizontal and vertical flips (each applied with probability 0.5). In `intra_image`, a second view is created by randomly applying a horizontal, vertical, or combined flip to the first view. There is no rotation, crop, translation, or colour augmentation; flips retain the entire image and avoid rotation interpolation or blank borders.
+
+**How the losses are computed.** At each feature scale, the projector produces embeddings with shape `(batch, views, projection_dim)`. With `cross_camera`, views are grouped by camera; each camera's target is the mean embedding of the *other* cameras in the same frame, and the prediction term is the mean squared error from every view to its camera's target. With `intra_image`, the two flipped views of each image are compared directly with mean squared error. Both prediction losses encourage agreement, but across different sources of views.
 
 SIGReg evaluates the embedding distribution separately for each view. It projects the batch onto many random unit directions, compares the empirical characteristic function on those one-dimensional projections with the characteristic function of a standard normal, and integrates the squared discrepancy over a fixed range. This sliced test encourages embeddings to have a spread, isotropic distribution instead of all collapsing to the same value. Prediction and SIGReg are each averaged across P3/P4/P5 before they are combined by λ. The reported component losses are detached from autograd; the combined training loss remains differentiable.
 
@@ -102,10 +104,10 @@ summary = run_detection_evaluation(det)
 
 ## Lambda sweep and `intra_image` loss
 
-`PretrainConfig` now carries the sweep and loss-variant options (defaults shown): `lambdas=(0.1, 0.2, 0.3, 0.4, 0.5)`, `epochs=100`, `image_size=640` (multiple of 32, shared with detection), `pred_loss_mode="cross_camera"` or `"intra_image"`, `pool_cameras=(1, 2, 5, 6)`, `max_rotation_deg=15.0` and `overwrite=False`.
+`PretrainConfig` now carries the sweep and loss-variant options (defaults shown): `lambdas=(0.1, 0.2, 0.3, 0.4, 0.5)`, `epochs=100`, `image_size=640` (multiple of 32, shared with detection), `pred_loss_mode="cross_camera"` or `"intra_image"`, `pool_cameras=(1, 2, 5, 6)` and `overwrite=False`.
 
 - `"cross_camera"` (default, unchanged): each camera view is pulled toward the mean embedding of the other cameras.
-- `"intra_image"`: each image from `pool_cameras` yields two views (horizontal flip, vertical flip, rotation within ±`max_rotation_deg`; no crops or colour changes) and the MSE between their multi-scale GAP embeddings is the prediction loss. SIGReg is applied to the same embeddings.
+- `"intra_image"`: each image from `pool_cameras` yields two views using random horizontal/vertical flips only (no rotation, crops or colour changes); the MSE between their multi-scale GAP embeddings is the prediction loss. SIGReg is applied to the same embeddings.
 
 ```python
 from lejepa_cotton import (PretrainConfig, DetectionEvalConfig, WeightSources,
