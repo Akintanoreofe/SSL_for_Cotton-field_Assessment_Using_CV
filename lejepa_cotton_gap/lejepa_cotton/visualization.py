@@ -160,7 +160,7 @@ def save_pretraining_loss_curves(history: pd.DataFrame, out_path: Path) -> Path:
         The written file.
     """
     panels = {"Total LeJEPA loss": ["total"],
-              "Cross-camera prediction": sorted(c for c in history if c.startswith("pred")),
+              "Prediction loss": sorted(c for c in history if c.startswith("pred")),
               "SIGReg": sorted(c for c in history if c.startswith("sigreg"))}
     fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4))
     for ax, (title, columns) in zip(axes, panels.items()):

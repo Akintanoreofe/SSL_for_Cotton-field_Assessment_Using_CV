@@ -190,6 +190,10 @@ class PretrainConfig:
     checkpoint_name: str = "gap_lejepa_yolov8n.pth"
 
     def __post_init__(self) -> None:
+        if isinstance(self.gem, dict):
+            self.gem = GeMConfig(**self.gem)
+        if isinstance(self.rotation, dict):
+            self.rotation = RotationConfig(**self.rotation)
         self.image_root = Path(self.image_root)
         self.output_dir = Path(self.output_dir)
         self.cameras = tuple(int(c) for c in self.cameras)
@@ -221,6 +225,8 @@ class PretrainConfig:
             raise ValueError("Cross-camera prediction needs at least two cameras.")
         if self.prediction_pairing == "intra_image" and not self.pool_cameras:
             raise ValueError("Intra-image prediction needs at least one pool camera.")
+        self.global_scale = tuple(float(v) for v in self.global_scale)
+        self.local_scale = tuple(float(v) for v in self.local_scale)
         for name, scale in (("global_scale", self.global_scale), ("local_scale", self.local_scale)):
             if len(scale) != 2 or not 0 < scale[0] <= scale[1] <= 1:
                 raise ValueError(f"{name} must be a pair satisfying 0 < min <= max <= 1.")
@@ -871,6 +877,7 @@ class YOLOv8MultiScaleBackbone(nn.Module):
         self.pretrain_neck = bool(pretrain_neck)
         self.detect_sources = detect_sources
         self.capture_indices = dict(zip(detect_sources, ("P3", "P4", "P5"))) if pretrain_neck else self.CAPTURE
+        self.saved_indices = set(detection_model.save) | set(self.capture_indices)
         end = max(detect_sources) + 1 if pretrain_neck else self.NUM_LAYERS
         self.layers = nn.ModuleList(list(detection_model.model[:end]))
         self.weights = str(weights)
@@ -905,7 +912,7 @@ class YOLOv8MultiScaleBackbone(nn.Module):
                 else:
                     x = [x if item == -1 else outputs[item] for item in source]
             x = layer(x)
-            outputs.append(x)
+            outputs.append(x if index in self.saved_indices else None)
             if index in self.capture_indices:
                 features[self.capture_indices[index]] = x
         return features
@@ -1487,6 +1494,7 @@ def pretrain(
         stats = train_one_epoch(encoder, loader, sigreg, optimizer, len(cfg.cameras), cfg.lam, device,
                                 desc=f"Epoch {epoch + 1}/{cfg.epochs}", pred_loss_mode=cfg.prediction_pairing,
                                 scale_weights=cfg.scale_weights, cfg=cfg, global_step=epoch * len(loader))
+        stats.update({f"p_{name.lower()}": value for name, value in encoder.p_values().items()})
         records.append({"epoch": epoch + 1, **stats})
         if verbose:
             print(f"Epoch {epoch + 1:03d} | " + " | ".join(f"{k}={v:.5f}" for k, v in stats.items()))

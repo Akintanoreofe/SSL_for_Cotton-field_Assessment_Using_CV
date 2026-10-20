@@ -1,6 +1,6 @@
 # lejepa-cotton
 
-Cross-camera **LeJEPA** self-supervised pretraining of a **YOLOv8n** backbone with **global average pooling (GAP)**, evaluated against **COCO** weights on cotton-boll detection and plot-status classification.
+**LeJEPA** self-supervised pretraining for cotton-boll detection with **YOLOv8n**. The current default uses learnable GeM pooling and pretrains the PAN-FPN neck with a P3-only loss; GAP/backbone-only pretraining remains available for reproducing the legacy pipeline.
 
 For a short repository overview and quick start, see the [root README](../README.md).
 
@@ -49,34 +49,34 @@ Python ≥ 3.9, PyTorch ≥ 2.0, torchvision ≥ 0.16, Ultralytics ≥ 8.1.
 
 **Data.** Files are named `clip<n>_cam<k>_frame<m>.jpg`. `discover_camera_groups` groups images that share the same `clip` and `frame` and keeps only frames seen by *all* requested cameras. The default cameras are `(1, 2, 4)`, which are the 2nd, 3rd and 5th physical cameras. One training sample is one synchronised frame, and its views are the camera images, each augmented independently. `views_per_camera > 1` adds extra augmentations per camera.
 
-**Encoder.** `YOLOv8MultiScaleBackbone` takes layers 0–9 of `yolov8n.yaml`, so it starts from empty, randomly initialised weights, and returns the P3/P4/P5 feature maps. `YOLOv8GAPEncoder` global-average-pools each scale to a vector and passes it through its own 3-layer MLP projector.
+**Encoder.** The model is randomly initialised from `yolov8n.yaml`. `pretrain_neck=True` manually executes the YOLO graph through the neck and captures the Detect module's P3/P4/P5 inputs; `False` captures the legacy backbone stages. Each selected scale has a separate projector. Pooling can use GAP or bounded, learnable GeM (`p` initialised to 3, clamped to [1, 6]); GeM clamps activations to `1e-6` before exponentiation.
 
-**Objective** (per scale, then averaged):
+**Objective** (weighted sum across enabled scales):
 
-- *Cross-camera prediction loss*: every view of camera *c* is regressed onto the mean embedding of the **other** cameras of the same frame. The invariance being learned is therefore between viewpoints, not only between augmentations of one image.
+- *Intra-image prediction loss* (default): each view is regressed toward the mean embedding of the same source image's global views. Optional `prediction_pairing="cross_camera"` retains the previous synchronized-camera objective.
 - *SIGReg*: a sliced Epps–Pulley test pushes the embedding distribution toward an isotropic Gaussian, which prevents collapse.
-- `loss = (1 − λ)·prediction + λ·SIGReg`, with λ = 0.2 by default.
+- `loss = Σ_s scale_weight_s · ((1 − λ)·prediction_s + λ·SIGReg_s)`, with λ = 0.2 by default. Zero-weight scales are skipped entirely; SIGReg is evaluated over the full set of view embeddings at every active scale.
 
-**Pretraining augmentation.** Images are resized to the model input size and augmented only with random horizontal and vertical flips (each applied with probability 0.5). In `intra_image`, a second view is created by randomly applying a horizontal, vertical, or combined flip to the first view. There is no rotation, crop, translation, or colour augmentation; flips retain the entire image and avoid rotation interpolation or blank borders.
+**Pretraining augmentation.** The intra-image path samples two global crops (`global_scale=(0.4, 1.0)`) and applies independent flips and optional rotations. Rotation uses bilinear interpolation and reflect padding (default maximum ±15°, probability 0.5). `local_scale=(0.05, 0.25)` is exposed for crop configuration. No pixel-based salience heuristic or hand-crafted spatial prior is used.
 
-**How the losses are computed.** At each feature scale, the projector produces embeddings with shape `(batch, views, projection_dim)`. With `cross_camera`, views are grouped by camera; each camera's target is the mean embedding of the *other* cameras in the same frame, and the prediction term is the mean squared error from every view to its camera's target. With `intra_image`, the two flipped views of each image are compared directly with mean squared error. Both prediction losses encourage agreement, but across different sources of views.
+**How the losses are computed.** At each active feature scale, the projector produces embeddings with shape `(batch, views, projection_dim)`. The data loader returns a source-image group id for every view, and the prediction loss asserts groups are not mixed. Intra-image targets are the mean embeddings of an image's global views; the optional cross-camera objective uses the mean from other cameras in the same synchronized frame.
 
-SIGReg evaluates the embedding distribution separately for each view. It projects the batch onto many random unit directions, compares the empirical characteristic function on those one-dimensional projections with the characteristic function of a standard normal, and integrates the squared discrepancy over a fixed range. This sliced test encourages embeddings to have a spread, isotropic distribution instead of all collapsing to the same value. Prediction and SIGReg are each averaged across P3/P4/P5 before they are combined by λ. The reported component losses are detached from autograd; the combined training loss remains differentiable.
+SIGReg projects the batch onto random unit directions, compares the empirical characteristic function with a standard normal, and integrates the squared discrepancy over a fixed range. The reported component losses are detached from autograd; the combined training loss remains differentiable. Training logs active scales' losses and GeM exponents and periodically writes P3 activation-energy overlays under `debug/`.
 
-**Export.** `export_backbone_to_yolo` writes a real Ultralytics `.pt` checkpoint whose layers 0–9 are the pretrained backbone. This step matters. `YOLO("yolov8n.yaml").train()` rebuilds the network from scratch, so weights copied into a YAML-built model in memory are silently discarded.
+**Export.** `transfer="backbone"` exports layers 0–9; `transfer="backbone+neck"` exports layers 0–21. The Detect head remains random. Export reports matched, missing and unexpected keys and writes a real Ultralytics `.pt` checkpoint so fine-tuning does not discard the pretraining weights.
 
 ## Evaluation variants
 
 | variant | backbone | neck + head |
 |---|---|---|
-| `lejepa` | cross-camera GAP LeJEPA | random |
+| `lejepa` | configured LeJEPA transfer (`backbone` by default) | random Detect head; neck random for backbone-only transfer |
 | `coco` | COCO `yolov8n.pt` | COCO |
 | `coco_backbone` | COCO | random (like-for-like control for `lejepa`) |
 | `scratch` | random (`yolov8n.yaml`) | random |
 
 The default comparison is `("lejepa", "coco")`. In detection, `coco` also brings a pretrained neck and head, so add `coco_backbone` when you want a comparison that isolates the backbone.
 
-1. **Detection fine-tuning** (`run_detection_evaluation`). The pipeline builds one reproducible train/val split, fine-tunes every variant with identical hyper-parameters, and reports precision, recall, mAP50 and mAP50-95. Validation uses Ultralytics' default low confidence threshold so that mAP is computed over the whole precision–recall curve. The `conf` setting only affects the drawn overlays.
+1. **Detection fine-tuning** (`run_detection_evaluation`). The pipeline builds one reproducible train/val split, fine-tunes every variant with identical hyper-parameters, and reports precision, recall, AP50, AP50-95 and AP75. Validation uses Ultralytics' default low confidence threshold so that AP is computed over the whole precision–recall curve. The `conf` setting only affects the drawn overlays.
 2. **Linear probe** (`run_probe_evaluation`). The backbone is frozen, and its BatchNorm layers are kept in eval mode. A linear layer is trained on the concatenated P3/P4/P5 GAP vectors using a stratified split, and the pipeline reports accuracy, macro-F1 and a confusion matrix. Model selection uses the lowest test loss, which mirrors the original protocol. Use a separate validation split if you need an unbiased estimate.
 
 ## Usage
@@ -102,12 +102,48 @@ det = DetectionEvalConfig(source_dir="path/to/image_dataset", output_dir="output
 summary = run_detection_evaluation(det)
 ```
 
+## Pretraining configuration examples
+
+The dataclasses below expose the same options used in the notebook. The first example reproduces the legacy GAP/backbone/cross-camera behavior; the second is the GeM + neck + P3 default.
+
+```python
+from lejepa_cotton import GeMConfig, PretrainConfig, RotationConfig
+
+# Legacy GAP, backbone-only, no rotation.
+legacy = PretrainConfig(
+    image_root="path/to/images", output_dir="outputs/legacy",
+    pooling="gap", pretrain_neck=False,
+    scale_weights={"p3": 1 / 3, "p4": 1 / 3, "p5": 1 / 3},
+    prediction_pairing="cross_camera", rotation=RotationConfig(enabled=False),
+    transfer="backbone",
+)
+
+# New default: learnable GeM, neck attached, P3-only loss.
+modern = PretrainConfig(
+    image_root="path/to/images", output_dir="outputs/gem_neck",
+    pooling="gem", gem=GeMConfig(p_init=3.0, p_min=1.0, p_max=6.0, learnable_p=True),
+    pretrain_neck=True, scale_weights={"p3": 1.0, "p4": 0.0, "p5": 0.0},
+    transfer="backbone", prediction_pairing="intra_image",
+    rotation=RotationConfig(enabled=True, max_deg=15, p=0.5),
+    global_scale=(0.4, 1.0), local_scale=(0.05, 0.25),
+)
+```
+
+Set `transfer="backbone+neck"` to export the pretrained PAN-FPN layers as well. `DetectionEvalConfig` provides `freeze_backbone_epochs` (default 0) and `backbone_lr_mult` (default 1.0); these settings are applied to every compared initialization. Detection metrics include AP50, AP50-95 and AP75.
+
+For video inference from a fine-tuned detector:
+
+```bash
+python -m lejepa_cotton.predict_video --weights outputs/detection/runs/lejepa/weights/best.pt \
+  --video path/to/cotton_field.mp4 --out-dir outputs/video
+```
+
 ## Lambda sweep and `intra_image` loss
 
-`PretrainConfig` now carries the sweep and loss-variant options (defaults shown): `lambdas=(0.1, 0.2, 0.3, 0.4, 0.5)`, `epochs=100`, `image_size=640` (multiple of 32, shared with detection), `pred_loss_mode="cross_camera"` or `"intra_image"`, `pool_cameras=(1, 2, 5, 6)` and `overwrite=False`.
+`PretrainConfig` carries the sweep, pooling and pairing options: `lambdas=(0.1, 0.2, 0.3, 0.4, 0.5)`, `epochs=100`, `image_size=640` (multiple of 32, shared with detection), `pooling="gem"` or `"gap"`, `prediction_pairing="intra_image"` or `"cross_camera"`, `pool_cameras=(1, 2, 5, 6)` and `overwrite=False`. The legacy `pred_loss_mode` argument remains a compatibility alias.
 
-- `"cross_camera"` (default, unchanged): each camera view is pulled toward the mean embedding of the other cameras.
-- `"intra_image"`: each image from `pool_cameras` yields two views using random horizontal/vertical flips only (no rotation, crops or colour changes); the MSE between their multi-scale GAP embeddings is the prediction loss. SIGReg is applied to the same embeddings.
+- `"cross_camera"`: each camera view is pulled toward the mean embedding of the other cameras from the same synchronized frame.
+- `"intra_image"` (default): each image from `pool_cameras` yields independent augmented global views; the prediction term compares each view with that image's global-view mean embedding. SIGReg is applied to all active scale embeddings.
 
 ```python
 from lejepa_cotton import (PretrainConfig, DetectionEvalConfig, WeightSources,

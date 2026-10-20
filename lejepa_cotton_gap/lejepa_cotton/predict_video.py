@@ -48,7 +48,6 @@ def predict_video(
         capture.release()
         raise ValueError(f"Could not create output video: {video_out}")
 
-    model = YOLO(str(weights))
     fields = ["frame_idx", "timestamp_s", "n_bolls", "mean_conf"]
     if track:
         fields.append("unique_tracks")
@@ -56,6 +55,7 @@ def predict_video(
     processed, frame_idx = 0, -1
     start = time.perf_counter()
     try:
+        model = YOLO(str(weights))
         with csv_out.open("w", newline="", encoding="utf-8") as handle:
             rows = csv.DictWriter(handle, fieldnames=fields)
             rows.writeheader()
@@ -93,6 +93,10 @@ def predict_video(
     finally:
         capture.release()
         writer.release()
+
+    if processed == 0:
+        video_out.unlink(missing_ok=True)
+        raise ValueError(f"Video contains no readable frames: {video_path}")
 
     elapsed = max(time.perf_counter() - start, 1e-9)
     summary = {

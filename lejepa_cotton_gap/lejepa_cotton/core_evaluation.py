@@ -590,8 +590,8 @@ class DetectionEvalConfig:
         self.output_dir = Path(self.output_dir)
         self.variants = tuple(validate_variant(v) for v in self.variants)
         validate_image_size(self.image_size)
-        if self.freeze_backbone_epochs < 0 or self.backbone_lr_mult <= 0:
-            raise ValueError("freeze_backbone_epochs must be non-negative and backbone_lr_mult must be positive.")
+        if not 0 <= self.freeze_backbone_epochs <= self.epochs or self.backbone_lr_mult <= 0:
+            raise ValueError("freeze_backbone_epochs must be in [0, epochs] and backbone_lr_mult must be positive.")
 
     @property
     def split_dir(self) -> Path:
@@ -898,10 +898,12 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
     """
     model = YOLO(init_weights)
     init_report: Dict[str, float] = {}
-    model.add_callback("on_train_start", partial(set_backbone_lr_multiplier,
-                                                 multiplier=cfg.backbone_lr_mult))
-    model.add_callback("on_train_epoch_start", partial(apply_backbone_freeze_warmup,
-                                                        freeze_epochs=cfg.freeze_backbone_epochs))
+    if cfg.backbone_lr_mult != 1.0:
+        model.add_callback("on_train_start", partial(set_backbone_lr_multiplier,
+                                                     multiplier=cfg.backbone_lr_mult))
+    if cfg.freeze_backbone_epochs:
+        model.add_callback("on_train_epoch_start", partial(apply_backbone_freeze_warmup,
+                                                            freeze_epochs=cfg.freeze_backbone_epochs))
     if coco_state is not None:
         model.add_callback("on_train_start", partial(record_initialisation, variant=audit_variant or run_name,
                                                      coco_state=coco_state, report=init_report))

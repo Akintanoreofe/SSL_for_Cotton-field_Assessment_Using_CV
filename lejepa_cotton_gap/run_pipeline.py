@@ -1,4 +1,4 @@
-"""Run cross-camera GAP LeJEPA pretraining, evaluation and visualization.
+"""Run LeJEPA pretraining, evaluation and visualization.
 
 Edit the paths below, then run ``python run_pipeline.py``. This script only
 builds configurations and calls package functions; all logic lives in
