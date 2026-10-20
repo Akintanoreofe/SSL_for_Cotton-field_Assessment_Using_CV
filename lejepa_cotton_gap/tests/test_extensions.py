@@ -61,6 +61,57 @@ def test_train_one_epoch_averages_metrics_without_per_step_output(monkeypatch, c
     assert capsys.readouterr().out == ""
 
 
+def test_train_one_epoch_can_show_batch_progress(monkeypatch):
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, views):
+            return {"feature": self.weight * views.mean()}
+
+        def clamp_gem_parameters(self):
+            pass
+
+    progress_options = {}
+
+    def track_progress(iterable, **kwargs):
+        progress_options.update(kwargs)
+        return iterable
+
+    monkeypatch.setattr(core_pretraining, "tqdm", track_progress)
+    monkeypatch.setattr(
+        core_pretraining,
+        "lejepa_loss",
+        lambda projections, *_args: (
+            projections["feature"].square(),
+            {"total": projections["feature"].detach()},
+        ),
+    )
+    encoder = Encoder()
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(
+            torch.ones((1, 1, 1)),
+            torch.zeros(1, dtype=torch.long),
+            torch.zeros(1, dtype=torch.long),
+        ),
+        batch_size=1,
+    )
+    optimizer = torch.optim.SGD(encoder.parameters(), lr=0)
+
+    core_pretraining.train_one_epoch(
+        encoder, loader, None, optimizer, 1, 0.2, torch.device("cpu"),
+        desc="Epoch 1/1", show_progress=True,
+    )
+
+    assert progress_options == {
+        "desc": "Epoch 1/1",
+        "unit": "batch",
+        "leave": False,
+        "disable": False,
+    }
+
+
 def test_train_one_epoch_returns_empty_stats_for_empty_loader():
     encoder = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(encoder.parameters(), lr=0.01)
