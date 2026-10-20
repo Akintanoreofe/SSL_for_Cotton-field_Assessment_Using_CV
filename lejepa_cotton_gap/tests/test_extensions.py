@@ -80,6 +80,21 @@ def test_train_one_epoch_returns_empty_stats_for_empty_loader():
     assert stats == {}
 
 
+def test_pretrain_rejects_empty_loader(tmp_path):
+    cfg = PretrainConfig(image_root=tmp_path, output_dir=tmp_path, epochs=1)
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(
+            torch.empty((0, 1, 1)),
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.long),
+        ),
+        batch_size=1,
+    )
+
+    with pytest.raises(ValueError, match="contains no batches"):
+        core_pretraining.pretrain(cfg, loader=loader, verbose=False)
+
+
 def test_train_one_epoch_enables_step_diagnostics_when_configured(monkeypatch, capsys, tmp_path):
     class Encoder(torch.nn.Module):
         def __init__(self):

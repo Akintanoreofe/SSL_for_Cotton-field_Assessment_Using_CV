@@ -1390,6 +1390,7 @@ def train_one_epoch(
         Compute device.
     desc : str, default=""
         Optional label prefix for explicitly enabled step diagnostics.
+        No per-batch progress bar is displayed.
     pred_loss_mode : {"cross_camera", "intra_image"}, default="cross_camera"
         Prediction-loss variant.
     cfg : PretrainConfig or None, default=None
@@ -1485,7 +1486,7 @@ def pretrain(
     on_epoch_end : callable or None, default=None
         Called as ``on_epoch_end(epoch, encoder, loader)`` after each epoch.
     verbose : bool, default=True
-        Print one summary line per epoch.
+        Print one summary line per epoch; no per-batch progress bar is shown.
 
     Returns
     -------
@@ -1496,7 +1497,9 @@ def pretrain(
     """
     torch.manual_seed(cfg.seed)
     device = select_device(cfg.device)
-    loader = loader or build_pretraining_loader(cfg, verbose)
+    loader = build_pretraining_loader(cfg, verbose) if loader is None else loader
+    if len(loader) == 0:
+        raise ValueError("Pretraining data loader contains no batches.")
     encoder = YOLOv8GAPEncoder(
         cfg.model_cfg, cfg.proj_dim, cfg.hidden_dim, cfg.pooling, cfg.gem,
         cfg.pretrain_neck, cfg.scale_weights,
