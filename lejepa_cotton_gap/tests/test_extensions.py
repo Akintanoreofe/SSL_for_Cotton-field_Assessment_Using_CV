@@ -60,6 +60,60 @@ def test_train_one_epoch_averages_metrics_without_per_step_output(monkeypatch, c
     assert capsys.readouterr().out == ""
 
 
+def test_train_one_epoch_enables_step_diagnostics_when_configured(monkeypatch, capsys, tmp_path):
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(2.0))
+
+        def forward(self, views):
+            return {"feature": self.weight * views.mean()}
+
+        def clamp_gem_parameters(self):
+            pass
+
+        def p_values(self):
+            return {"P3": 2.0}
+
+    def fake_lejepa_loss(projections, *_args):
+        loss = projections["feature"].square()
+        return loss, {"total": loss.detach()}
+
+    debug_paths = []
+    monkeypatch.setattr(core_pretraining, "lejepa_loss", fake_lejepa_loss)
+    monkeypatch.setattr(
+        core_pretraining,
+        "save_activation_debug_grid",
+        lambda _encoder, _views, path: debug_paths.append(path),
+    )
+    cfg = PretrainConfig(
+        image_root=tmp_path,
+        output_dir=tmp_path,
+        log_every_n_steps=1,
+        debug_every_n_steps=1,
+    )
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(
+            torch.tensor([[[1.0]], [[3.0]]]),
+            torch.zeros(2, dtype=torch.long),
+            torch.zeros(2, dtype=torch.long),
+        ),
+        batch_size=1,
+    )
+    encoder = Encoder()
+    optimizer = torch.optim.SGD(encoder.parameters(), lr=0)
+
+    core_pretraining.train_one_epoch(
+        encoder, loader, None, optimizer, 1, 0.2, torch.device("cpu"),
+        desc="train", cfg=cfg,
+    )
+
+    output = capsys.readouterr().out
+    assert "train step=1 P3.p=2.000" in output
+    assert "train step=2 P3.p=2.000" in output
+    assert len(debug_paths) == 2
+
+
 def test_gem_p_one_matches_gap_and_handles_negative_inputs():
     pooling = GeM(p_init=1.0, p_min=1.0, p_max=6.0)
     positive = torch.rand(2, 3, 5, 7)
