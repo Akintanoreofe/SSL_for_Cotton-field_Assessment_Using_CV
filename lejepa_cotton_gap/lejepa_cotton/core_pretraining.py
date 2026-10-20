@@ -1506,6 +1506,7 @@ def pretrain(
     records = []
     for epoch in range(cfg.epochs):
         stats = train_one_epoch(encoder, loader, sigreg, optimizer, len(cfg.cameras), cfg.lam, device,
+                                desc=f"Epoch {epoch + 1}/{cfg.epochs}",
                                 pred_loss_mode=cfg.prediction_pairing, scale_weights=cfg.scale_weights,
                                 cfg=cfg, global_step=epoch * len(loader))
         stats.update({f"p_{name.lower()}": value for name, value in encoder.p_values().items()})
