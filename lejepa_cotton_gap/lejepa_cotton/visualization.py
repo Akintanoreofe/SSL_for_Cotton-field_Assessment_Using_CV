@@ -473,7 +473,7 @@ def save_pretraining_view_examples(cfg: PretrainConfig, out_path: Path, num_samp
             ax.set_yticks([])
             if cfg.pred_loss_mode == "intra_image":
                 ax.set_title(f"Sample {row + 1} | View {col + 1}\n(camera {int(camera_ids[col])}, "
-                             f"rotation/flip/crop)", fontsize=9)
+                             f"random flips)", fontsize=9)
             else:
                 ax.set_title(f"Sample {row + 1} | View {col + 1}\ncamera {int(camera_ids[col])}", fontsize=9)
     fig.suptitle(f"Final views entering the encoder (mode: {cfg.pred_loss_mode}, "
