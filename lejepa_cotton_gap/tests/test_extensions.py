@@ -89,6 +89,7 @@ def test_neck_returns_detect_scales_at_expected_strides():
 def test_gap_backbone_legacy_config_uses_all_scales_and_cross_camera(tmp_path):
     cfg = PretrainConfig(image_root=tmp_path, output_dir=tmp_path, pooling="gap",
                          pretrain_neck=False, rotation={"enabled": False})
+    assert cfg.log_every_n_steps == cfg.debug_every_n_steps == 0
     assert cfg.prediction_pairing == "cross_camera"
     assert cfg.scale_weights == {"p3": 1 / 3, "p4": 1 / 3, "p5": 1 / 3}
     torch.manual_seed(7)

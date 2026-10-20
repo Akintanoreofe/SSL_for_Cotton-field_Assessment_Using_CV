@@ -146,6 +146,10 @@ class PretrainConfig:
         Seed for sampling, shuffling and initialisation.
     device : str or None, default=None
         Torch device string. ``None`` picks MPS, then CUDA, then CPU.
+    log_every_n_steps : int, default=0
+        Optional interval for learned-GeM logging; zero disables step logging.
+    debug_every_n_steps : int, default=0
+        Optional interval for activation debug grids; zero disables them.
     checkpoint_name : str, default="gap_lejepa_yolov8n.pth"
         File name of the checkpoint written inside ``output_dir``.
     """
@@ -175,6 +179,8 @@ class PretrainConfig:
     rotation: RotationConfig = field(default_factory=RotationConfig)
     global_scale: Tuple[float, float] = (0.4, 1.0)
     local_scale: Tuple[float, float] = (0.05, 0.25)
+    log_every_n_steps: int = 0
+    debug_every_n_steps: int = 0
     overwrite: bool = False
     checkpoint_dir_name: str = "checkpoints"
     sigreg_knots: int = 17
@@ -227,6 +233,8 @@ class PretrainConfig:
         for name, scale in (("global_scale", self.global_scale), ("local_scale", self.local_scale)):
             if len(scale) != 2 or not 0 < scale[0] <= scale[1] <= 1:
                 raise ValueError(f"{name} must be a pair satisfying 0 < min <= max <= 1.")
+        if self.log_every_n_steps < 0 or self.debug_every_n_steps < 0:
+            raise ValueError("Logging and debug intervals must be non-negative.")
         validate_image_size(self.image_size)
         if not all(0.0 <= v <= 1.0 for v in (self.lam, *self.lambdas)):
             raise ValueError("lam and every value of lambdas must lie in [0, 1].")
@@ -1356,8 +1364,11 @@ def train_one_epoch(
     num_cameras: int,
     lam: float,
     device: torch.device,
+    desc: str = "",
     pred_loss_mode: str = "cross_camera",
     scale_weights: Optional[Dict[str, float]] = None,
+    cfg: Optional[PretrainConfig] = None,
+    global_step: int = 0,
 ) -> Dict[str, float]:
     """Run one optimisation pass over the loader.
 
@@ -1377,8 +1388,15 @@ def train_one_epoch(
         SIGReg weight.
     device : torch.device
         Compute device.
+    desc : str, default=""
+        Retained for compatibility; batch progress output is disabled.
     pred_loss_mode : {"cross_camera", "intra_image"}, default="cross_camera"
         Prediction-loss variant.
+    cfg : PretrainConfig or None, default=None
+        Optional legacy per-step diagnostics configuration; intervals default
+        to zero so they are disabled unless explicitly enabled.
+    global_step : int, default=0
+        Starting step index for optional diagnostics.
 
     Returns
     -------
@@ -1400,11 +1418,19 @@ def train_one_epoch(
         optimizer.step()
         encoder.clamp_gem_parameters()
         for key, value in logs.items():
+            value = value.detach()
             if key in totals:
                 totals[key] += value
             else:
                 totals[key] = value.clone()
         n_batches += 1
+        global_step += 1
+        if cfg and cfg.log_every_n_steps and global_step % cfg.log_every_n_steps == 0:
+            print(f"step={global_step} " + " ".join(f"{name}.p={value:.3f}"
+                  for name, value in encoder.p_values().items()))
+        if cfg and cfg.debug_every_n_steps and global_step % cfg.debug_every_n_steps == 0:
+            debug_path = cfg.output_dir / "debug" / f"p3_activation_step_{global_step:07d}.png"
+            save_activation_debug_grid(encoder, views, debug_path)
     if not totals:
         return {}
     keys = list(totals)
@@ -1482,7 +1508,8 @@ def pretrain(
     records = []
     for epoch in range(cfg.epochs):
         stats = train_one_epoch(encoder, loader, sigreg, optimizer, len(cfg.cameras), cfg.lam, device,
-                                pred_loss_mode=cfg.prediction_pairing, scale_weights=cfg.scale_weights)
+                                pred_loss_mode=cfg.prediction_pairing, scale_weights=cfg.scale_weights,
+                                cfg=cfg, global_step=epoch * len(loader))
         stats.update({f"p_{name.lower()}": value for name, value in encoder.p_values().items()})
         records.append({"epoch": epoch + 1, **stats})
         if verbose:
