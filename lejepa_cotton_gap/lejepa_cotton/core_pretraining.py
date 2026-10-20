@@ -33,7 +33,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import tqdm
 import ultralytics
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -176,8 +175,6 @@ class PretrainConfig:
     rotation: RotationConfig = field(default_factory=RotationConfig)
     global_scale: Tuple[float, float] = (0.4, 1.0)
     local_scale: Tuple[float, float] = (0.05, 0.25)
-    log_every_n_steps: int = 100
-    debug_every_n_steps: int = 100
     overwrite: bool = False
     checkpoint_dir_name: str = "checkpoints"
     sigreg_knots: int = 17
@@ -230,8 +227,6 @@ class PretrainConfig:
         for name, scale in (("global_scale", self.global_scale), ("local_scale", self.local_scale)):
             if len(scale) != 2 or not 0 < scale[0] <= scale[1] <= 1:
                 raise ValueError(f"{name} must be a pair satisfying 0 < min <= max <= 1.")
-        if self.log_every_n_steps <= 0 or self.debug_every_n_steps <= 0:
-            raise ValueError("Logging and debug intervals must be positive.")
         validate_image_size(self.image_size)
         if not all(0.0 <= v <= 1.0 for v in (self.lam, *self.lambdas)):
             raise ValueError("lam and every value of lambdas must lie in [0, 1].")
@@ -1364,8 +1359,6 @@ def train_one_epoch(
     desc: str = "",
     pred_loss_mode: str = "cross_camera",
     scale_weights: Optional[Dict[str, float]] = None,
-    cfg: Optional[PretrainConfig] = None,
-    global_step: int = 0,
 ) -> Dict[str, float]:
     """Run one optimisation pass over the loader.
 
@@ -1396,9 +1389,9 @@ def train_one_epoch(
         Epoch-averaged loss components.
     """
     encoder.train()
-    totals: Dict[str, float] = defaultdict(float)
+    totals: Dict[str, torch.Tensor] = {}
     n_batches = 0
-    for batch in tqdm.tqdm(loader, desc=desc, leave=False):
+    for batch in loader:
         views, _, image_ids = batch if len(batch) == 3 else (*batch, None)
         views = views.to(device, non_blocking=True)
         image_ids = image_ids.to(device, non_blocking=True) if image_ids is not None else None
@@ -1410,16 +1403,13 @@ def train_one_epoch(
         optimizer.step()
         encoder.clamp_gem_parameters()
         for key, value in logs.items():
-            totals[key] += float(value.cpu())
+            totals[key] = totals.get(key, torch.zeros_like(value)) + value
         n_batches += 1
-        global_step += 1
-        if cfg and global_step % cfg.log_every_n_steps == 0:
-            print(f"step={global_step} " + " ".join(f"{name}.p={value:.3f}"
-                  for name, value in encoder.p_values().items()))
-        if cfg and global_step % cfg.debug_every_n_steps == 0:
-            debug_path = cfg.output_dir / "debug" / f"p3_activation_step_{global_step:07d}.png"
-            save_activation_debug_grid(encoder, views, debug_path)
-    return {key: value / max(1, n_batches) for key, value in totals.items()}
+    if not totals:
+        return {}
+    keys = list(totals)
+    averages = torch.stack([totals[key] / n_batches for key in keys]).cpu().tolist()
+    return dict(zip(keys, averages))
 
 
 @torch.no_grad()
@@ -1493,7 +1483,7 @@ def pretrain(
     for epoch in range(cfg.epochs):
         stats = train_one_epoch(encoder, loader, sigreg, optimizer, len(cfg.cameras), cfg.lam, device,
                                 desc=f"Epoch {epoch + 1}/{cfg.epochs}", pred_loss_mode=cfg.prediction_pairing,
-                                scale_weights=cfg.scale_weights, cfg=cfg, global_step=epoch * len(loader))
+                                scale_weights=cfg.scale_weights)
         stats.update({f"p_{name.lower()}": value for name, value in encoder.p_values().items()})
         records.append({"epoch": epoch + 1, **stats})
         if verbose:
