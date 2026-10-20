@@ -33,6 +33,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 import ultralytics
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -1369,6 +1370,7 @@ def train_one_epoch(
     scale_weights: Optional[Dict[str, float]] = None,
     cfg: Optional[PretrainConfig] = None,
     global_step: int = 0,
+    show_progress: bool = False,
 ) -> Dict[str, float]:
     """Run one optimisation pass over the loader.
 
@@ -1390,7 +1392,7 @@ def train_one_epoch(
         Compute device.
     desc : str, default=""
         Optional label prefix for explicitly enabled step diagnostics.
-        No per-batch progress bar is displayed.
+        Also used as the batch progress-bar label when enabled.
     pred_loss_mode : {"cross_camera", "intra_image"}, default="cross_camera"
         Prediction-loss variant.
     cfg : PretrainConfig or None, default=None
@@ -1399,6 +1401,8 @@ def train_one_epoch(
     global_step : int, default=0
         Starting step index for optional diagnostics, usually zero for each
         epoch.
+    show_progress : bool, default=False
+        Display a batch progress bar for this epoch.
 
     Returns
     -------
@@ -1409,7 +1413,11 @@ def train_one_epoch(
     encoder.train()
     totals: Dict[str, torch.Tensor] = {}
     n_batches = 0
-    for batch in loader:
+    if show_progress:
+        batches = tqdm(loader, desc=desc or "Training", unit="batch", leave=False)
+    else:
+        batches = loader
+    for batch in batches:
         views, _, image_ids = batch if len(batch) == 3 else (*batch, None)
         views = views.to(device, non_blocking=True)
         image_ids = image_ids.to(device, non_blocking=True) if image_ids is not None else None
@@ -1496,7 +1504,7 @@ def pretrain(
     on_epoch_end : callable or None, default=None
         Called as ``on_epoch_end(epoch, encoder, loader)`` after each epoch.
     verbose : bool, default=True
-        Print one summary line per epoch; no per-batch progress bar is shown.
+        Show a per-batch progress bar and print one summary line per epoch.
 
     Returns
     -------
@@ -1526,7 +1534,7 @@ def pretrain(
         stats = train_one_epoch(encoder, loader, sigreg, optimizer, len(cfg.cameras), cfg.lam, device,
                                 desc=f"Epoch {epoch + 1}/{cfg.epochs}",
                                 pred_loss_mode=cfg.prediction_pairing, scale_weights=cfg.scale_weights,
-                                cfg=cfg)
+                                cfg=cfg, show_progress=verbose)
         if not stats:
             raise ValueError("Pretraining data loader yielded no batches.")
         stats.update({f"p_{name.lower()}": value for name, value in encoder.p_values().items()})

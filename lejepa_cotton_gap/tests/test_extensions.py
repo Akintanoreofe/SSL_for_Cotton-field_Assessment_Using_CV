@@ -61,6 +61,80 @@ def test_train_one_epoch_averages_metrics_without_per_step_output(monkeypatch, c
     assert capsys.readouterr().out == ""
 
 
+def test_train_one_epoch_can_show_batch_progress(monkeypatch):
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, views):
+            return {"feature": self.weight * views.mean()}
+
+        def clamp_gem_parameters(self):
+            pass
+
+    progress_options = {}
+
+    def track_progress(iterable, **kwargs):
+        progress_options.update(kwargs)
+        return iterable
+
+    monkeypatch.setattr(core_pretraining, "tqdm", track_progress)
+    monkeypatch.setattr(
+        core_pretraining,
+        "lejepa_loss",
+        lambda projections, *_args: (
+            projections["feature"].square(),
+            {"total": projections["feature"].detach()},
+        ),
+    )
+    encoder = Encoder()
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(
+            torch.ones((1, 1, 1)),
+            torch.zeros(1, dtype=torch.long),
+            torch.zeros(1, dtype=torch.long),
+        ),
+        batch_size=1,
+    )
+    optimizer = torch.optim.SGD(encoder.parameters(), lr=0)
+
+    core_pretraining.train_one_epoch(
+        encoder, loader, None, optimizer, 1, 0.2, torch.device("cpu"),
+        desc="Epoch 1/1", show_progress=True,
+    )
+
+    assert progress_options == {
+        "desc": "Epoch 1/1",
+        "unit": "batch",
+        "leave": False,
+    }
+
+
+@pytest.mark.parametrize("verbose", [True, False])
+def test_pretrain_forwards_verbose_to_batch_progress(monkeypatch, tmp_path, verbose):
+    class Encoder(torch.nn.Module):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def p_values(self):
+            return {}
+
+    forwarded = []
+    monkeypatch.setattr(core_pretraining, "YOLOv8GAPEncoder", Encoder)
+    monkeypatch.setattr(
+        core_pretraining,
+        "train_one_epoch",
+        lambda *args, **kwargs: forwarded.append(kwargs["show_progress"]) or {"total": 1.0},
+    )
+    cfg = PretrainConfig(image_root=tmp_path, output_dir=tmp_path, epochs=1, device="cpu")
+
+    core_pretraining.pretrain(cfg, loader=[None], verbose=verbose)
+
+    assert forwarded == [verbose]
+
+
 def test_train_one_epoch_returns_empty_stats_for_empty_loader():
     encoder = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(encoder.parameters(), lr=0.01)
