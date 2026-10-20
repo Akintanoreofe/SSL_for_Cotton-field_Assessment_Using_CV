@@ -108,8 +108,31 @@ def test_train_one_epoch_can_show_batch_progress(monkeypatch):
         "desc": "Epoch 1/1",
         "unit": "batch",
         "leave": False,
-        "disable": False,
     }
+
+
+@pytest.mark.parametrize("verbose", [True, False])
+def test_pretrain_forwards_verbose_to_batch_progress(monkeypatch, tmp_path, verbose):
+    class Encoder(torch.nn.Module):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def p_values(self):
+            return {}
+
+    forwarded = []
+    monkeypatch.setattr(core_pretraining, "YOLOv8GAPEncoder", Encoder)
+    monkeypatch.setattr(
+        core_pretraining,
+        "train_one_epoch",
+        lambda *args, **kwargs: forwarded.append(kwargs["show_progress"]) or {"total": 1.0},
+    )
+    cfg = PretrainConfig(image_root=tmp_path, output_dir=tmp_path, epochs=1, device="cpu")
+
+    core_pretraining.pretrain(cfg, loader=[None], verbose=verbose)
+
+    assert forwarded == [verbose]
 
 
 def test_train_one_epoch_returns_empty_stats_for_empty_loader():

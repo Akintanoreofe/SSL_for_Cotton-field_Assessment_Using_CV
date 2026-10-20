@@ -1413,7 +1413,7 @@ def train_one_epoch(
     encoder.train()
     totals: Dict[str, torch.Tensor] = {}
     n_batches = 0
-    batches = tqdm(loader, desc=desc or "Training", unit="batch", leave=False, disable=not show_progress)
+    batches = tqdm(loader, desc=desc or "Training", unit="batch", leave=False) if show_progress else loader
     for batch in batches:
         views, _, image_ids = batch if len(batch) == 3 else (*batch, None)
         views = views.to(device, non_blocking=True)
