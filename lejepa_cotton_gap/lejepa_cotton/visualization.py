@@ -172,66 +172,6 @@ def save_pretraining_loss_curves(history: pd.DataFrame, out_path: Path) -> Path:
     return save_figure(fig, out_path)
 
 
-def save_lambda_loss_curves(histories: Dict[float, pd.DataFrame], out_path: Path) -> Path:
-    """Plot total, prediction and SIGReg loss per epoch, one line per lambda.
-
-    Parameters
-    ----------
-    histories : dict of float to pandas.DataFrame
-        Lambda to loss history (columns ``epoch``, ``total``, ``pred``,
-        ``sigreg``).
-    out_path : pathlib.Path
-        Destination ``.png``.
-
-    Returns
-    -------
-    pathlib.Path
-        The written file.
-    """
-    panels = {"Total loss": "total", "Prediction loss": "pred", "SIGReg": "sigreg"}
-    fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4))
-    for ax, (title, column) in zip(axes, panels.items()):
-        for lam, history in sorted(histories.items()):
-            ax.plot(history["epoch"], history[column], label=f"$\\lambda$={lam:g}")
-        ax.set(title=title, xlabel="Epoch", ylabel="Loss")
-        ax.grid(True, alpha=0.4)
-        ax.legend(fontsize=8)
-    return save_figure(fig, out_path)
-
-
-def save_metric_vs_lambda(summary: pd.DataFrame, out_path: Path, baseline: str = "coco_backbone") -> Path:
-    """Line plot of mAP50 and mAP50-95 against lambda with a COCO baseline.
-
-    Parameters
-    ----------
-    summary : pandas.DataFrame
-        One row per model with columns ``variant``, ``lambda`` (NaN for the
-        baseline), ``mAP50`` and ``mAP50-95``.
-    out_path : pathlib.Path
-        Destination ``.png``.
-    baseline : str, default="coco_backbone"
-        ``variant`` value of the baseline row, drawn as dashed lines.
-
-    Returns
-    -------
-    pathlib.Path
-        The written file.
-    """
-    sweep = summary[summary["variant"] != baseline].sort_values("lambda")
-    base = summary[summary["variant"] == baseline]
-    fig, ax = plt.subplots(figsize=(7, 5))
-    for metric in ("mAP50", "mAP50-95"):
-        line, = ax.plot(sweep["lambda"], sweep[metric], marker="o", label=f"LeJEPA Backbone {metric}")
-        if len(base):
-            ax.axhline(float(base[metric].iloc[0]), linestyle="--", color=line.get_color(),
-                       label=f"COCO Backbone {metric}")
-    ax.set(title="Detection accuracy vs $\\lambda$", xlabel="$\\lambda$ (SIGReg weight)", ylabel="Score")
-    ax.set_xticks(sweep["lambda"])
-    ax.grid(True, alpha=0.4)
-    ax.legend()
-    return save_figure(fig, out_path)
-
-
 def save_box_comparison(boxes_csv: Path, image_dir: Path, out_path: Path, max_images: int = 4) -> Path:
     """Draw ground-truth (green) and predicted (red) boxes from a saved box file.
 

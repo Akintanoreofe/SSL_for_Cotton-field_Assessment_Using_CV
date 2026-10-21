@@ -49,13 +49,15 @@ Python ≥ 3.9, PyTorch ≥ 2.0, torchvision ≥ 0.16, Ultralytics ≥ 8.1.
 
 **Data.** Files are named `clip<n>_cam<k>_frame<m>.jpg`. `discover_camera_groups` groups images that share the same `clip` and `frame` and keeps only frames seen by *all* requested cameras. The default cameras are `(1, 2, 4)`, which are the 2nd, 3rd and 5th physical cameras. One training sample is one synchronised frame, and its views are the camera images, each augmented independently. `views_per_camera > 1` adds extra augmentations per camera.
 
-**Encoder.** The model is randomly initialised from `yolov8n.yaml`. `pretrain_neck=True` manually executes the YOLO graph through the neck and captures the Detect module's P3/P4/P5 inputs; `False` captures the legacy backbone stages. Each selected scale has a separate projector. Pooling can use GAP or bounded, learnable GeM (`p` initialised to 3, clamped to [1, 6]); GeM clamps activations to `1e-6` before exponentiation.
+**Encoder.** The model is randomly initialised from `yolov8n.yaml`. `pretrain_neck=True` manually executes the YOLO graph through the neck and captures the Detect module's P3/P4/P5 inputs; `False` captures the legacy backbone stages. Each selected scale has a separate projector. Pooling can use GAP or GeM (`p` fixed at 3 by default; `learnable_p=True` learns it, clamped to [1, 6]); GeM clamps activations to `1e-6` before exponentiation.
 
 **Objective** (weighted sum across enabled scales):
 
 - *Intra-image prediction loss* (default): each view is regressed toward the mean embedding of the same source image's global views. Optional `prediction_pairing="cross_camera"` retains the previous synchronized-camera objective.
-- *SIGReg*: a sliced Epps–Pulley test pushes the embedding distribution toward an isotropic Gaussian, which prevents collapse.
-- `loss = Σ_s scale_weight_s · ((1 − λ)·prediction_s + λ·SIGReg_s)`, with λ = 0.2 by default. Zero-weight scales are skipped entirely; SIGReg is evaluated over the full set of view embeddings at every active scale.
+- *SIGReg* (`sigreg_mode`): `"hinge"` (default) is collapse-only — it penalises a projected std below `sigreg_std_floor` (1.0) or a sliced Epps–Pulley statistic above `sigreg_tolerance`, and is zero otherwise; `"isotropic"` pushes the embeddings toward an isotropic Gaussian (previous behaviour). The mode applies to both paths.
+- *Local path* (`use_local_sigreg=True`): a 1×1-conv projector on P3 gives per-location tokens; SIGReg is applied to `tokens_per_batch` (4096) randomly sampled tokens, weighted by `local_sigreg_weight`. No prediction loss on tokens. `use_local_sigreg=False` disables it.
+- `loss = Σ_s scale_weight_s · ((1 − λ)·prediction_s + λ·SIGReg_s) + local_sigreg_weight·SIGReg_local`, with the single weight `SIGREG_LAMBDA = 0.05` (defined once in `core_pretraining`; no sweep).
+- Per-step prediction / SIGReg / total losses are written to `step_losses.csv`; `log_every_n_steps` also prints them. Zero-weight scales are skipped entirely; SIGReg is evaluated over the full set of view embeddings at every active scale.
 
 **Pretraining augmentation.** The intra-image path samples two global crops (`global_scale=(0.4, 1.0)`) and applies independent flips and optional rotations. Rotation uses bilinear interpolation and reflect padding (default maximum ±15°, probability 0.5). `local_scale=(0.05, 0.25)` is exposed for crop configuration. No pixel-based salience heuristic or hand-crafted spatial prior is used.
 
@@ -118,10 +120,10 @@ legacy = PretrainConfig(
     transfer="backbone",
 )
 
-# New default: learnable GeM, neck attached, P3-only loss.
+# New default: fixed-p GeM, neck attached, P3-only loss.
 modern = PretrainConfig(
     image_root="path/to/images", output_dir="outputs/gem_neck",
-    pooling="gem", gem=GeMConfig(p_init=3.0, p_min=1.0, p_max=6.0, learnable_p=True),
+    pooling="gem", gem=GeMConfig(p_init=3.0, p_min=1.0, p_max=6.0, learnable_p=False),
     pretrain_neck=True, scale_weights={"p3": 1.0, "p4": 0.0, "p5": 0.0},
     transfer="backbone", prediction_pairing="intra_image",
     rotation=RotationConfig(enabled=True, max_deg=15, p=0.5),
@@ -138,28 +140,29 @@ python -m lejepa_cotton.predict_video --weights outputs/detection/runs/lejepa/we
   --video path/to/cotton_field.mp4 --out-dir outputs/video
 ```
 
-## Lambda sweep and `intra_image` loss
+## Pretraining options and Optuna tuning
 
-`PretrainConfig` carries the sweep, pooling and pairing options: `lambdas=(0.1, 0.2, 0.3, 0.4, 0.5)`, `epochs=100`, `image_size=640` (multiple of 32, shared with detection), `pooling="gem"` or `"gap"`, `prediction_pairing="intra_image"` or `"cross_camera"`, `pool_cameras=(1, 2, 5, 6)` and `overwrite=False`. The legacy `pred_loss_mode` argument remains a compatibility alias.
-
-- `"cross_camera"`: each camera view is pulled toward the mean embedding of the other cameras from the same synchronized frame.
-- `"intra_image"` (default): each image from `pool_cameras` yields independent augmented global views; the prediction term compares each view with that image's global-view mean embedding. SIGReg is applied to all active scale embeddings.
+`PretrainConfig` options: `epochs=100`, `image_size=640` (multiple of 32, shared with detection), `pooling="gem"` or `"gap"`, `prediction_pairing="intra_image"` (default) or `"cross_camera"`, `sigreg_mode="hinge"` or `"isotropic"`, `use_local_sigreg`, `local_sigreg_weight`, `tokens_per_batch`, `pool_cameras=(1, 2, 5, 6)`. The legacy `pred_loss_mode` argument remains a compatibility alias.
 
 ```python
-from lejepa_cotton import (PretrainConfig, DetectionEvalConfig, WeightSources,
-                           run_lambda_sweep, run_lambda_evaluation, plot_lambda_losses)
+from lejepa_cotton import (PretrainConfig, DetectionEvalConfig, WeightSources, TuningConfig,
+                           run_pretraining, run_tuning, retrain_best, print_best_params,
+                           plot_optimization_history, summary_table)
 
-pre = PretrainConfig(image_root="path/to/mars_multi_camera_boll", output_dir="outputs/pretraining",
-                     pred_loss_mode="intra_image")
-checkpoints = run_lambda_sweep(pre)        # outputs/pretraining/checkpoints/backbone_lambda_0.1.pt, ...
-plot_lambda_losses(pre)                    # total / prediction / SIGReg loss per lambda
+pre = PretrainConfig(image_root="path/to/mars_multi_camera_boll", output_dir="outputs/pretraining")
+run_pretraining(pre)
 
 det = DetectionEvalConfig(source_dir="path/to/image_dataset", output_dir="outputs/detection",
-                          weights=WeightSources(lejepa_checkpoint=checkpoints[0.1]))
-summary = run_lambda_evaluation(det, checkpoints)
+                          weights=WeightSources(lejepa_checkpoint=pre.checkpoint_path),
+                          val_ratio=0.2, test_ratio=0.2)
+tcfg = TuningConfig(n_trials=20)           # 30-epoch proxy trials, same budget for both arms
+studies = run_tuning(det, tcfg)            # TPE + median pruner, val mAP50-95; resumable (SQLite)
+print_best_params(studies); plot_optimization_history(studies)
+runs = retrain_best(det, tcfg, studies)    # best config per arm, 120 epochs x 3 seeds, test split
+print(summary_table(runs))                 # mean ± std of test mAP50 / mAP50-95
 ```
 
-Per lambda, `checkpoints/` also holds `backbone_lambda_<λ>_config.json` and `_history.csv`. A λ with an existing checkpoint is skipped unless `overwrite=True`. `run_lambda_evaluation` fine-tunes each λ backbone and the COCO backbone (neck/head random for all) and writes `summary_metrics.csv`, `plots/map_vs_lambda.png` (COCO as dashed line), `plots/lambda_vs_coco_bars.png` and, per model, `eval/boxes_lambda_<λ>.csv` / `eval/boxes_coco.csv` (image id, GT and predicted boxes, confidence, class, IoU, status `TP`/`FP`/`FN`/`EMPTY`). The notebook `notebooks/run_gap_lejepa_pipeline.ipynb` runs this whole flow.
+Tuning compares the LeJEPA-init and COCO-backbone-init arms with an identical search space (lr0, lrf, weight_decay, optimizer, warmup_epochs, backbone freeze epochs, backbone LR multiplier, mosaic, close_mosaic, mixup). Studies are stored in `detection/optuna/studies.db`; the test split is only read by `retrain_best`. `run_detection_evaluation` still fine-tunes the variants with default settings and writes `eval/boxes_<variant>.csv`. The notebook `notebooks/run_gap_lejepa_pipeline.ipynb` runs this whole flow.
 
 ## Outputs
 

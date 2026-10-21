@@ -11,7 +11,6 @@ This module owns everything needed to *learn* a representation:
 * the randomly initialised (``yolov8n.yaml``) multi-scale backbone,
 * the global-average-pooling (GAP) encoder and projectors,
 * the SIGReg regulariser and both prediction losses,
-* the lambda sweep helpers (checkpoint naming),
 * the training loop, checkpoint I/O and export of the backbone into an
   Ultralytics detection checkpoint.
 
@@ -23,7 +22,7 @@ import os
 import re
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -49,7 +48,9 @@ PRED_LOSS_MODES = ("cross_camera", "intra_image")
 POOLING_MODES = ("gem", "gap")
 TRANSFER_MODES = ("backbone", "backbone+neck")
 PREDICTION_PAIRINGS = ("intra_image", "cross_camera")
-DEFAULT_LAMBDAS = (0.1, 0.2, 0.3, 0.4, 0.5)
+SIGREG_LAMBDA = 0.05  # the single SIGReg weight; the only place it is defined
+SIGREG_MODES = ("hinge", "isotropic")
+SIGREG_TOLERANCE = 2.0  # Epps-Pulley statistic (scaled by N; ~1 for Gaussian data) tolerated by hinge mode
 DEFAULT_IMAGE_SIZE = 640
 
 CameraGroup = Dict[int, Path]
@@ -61,7 +62,7 @@ class GeMConfig:
     p_init: float = 3.0
     p_min: float = 1.0
     p_max: float = 6.0
-    learnable_p: bool = True
+    learnable_p: bool = False
 
     def __post_init__(self) -> None:
         if self.p_min <= 0 or not self.p_min <= self.p_init <= self.p_max:
@@ -115,23 +116,37 @@ class PretrainConfig:
         AdamW learning rate.
     weight_decay : float, default=1e-4
         AdamW weight decay.
-    lam : float, default=0.2
+    lam : float, default=SIGREG_LAMBDA (0.05)
         Weight of SIGReg; the prediction loss is weighted by ``1 - lam``.
-        Used by a single run; a sweep overrides it with each value of
-        ``lambdas``.
-    lambdas : tuple of float, default=(0.1, 0.2, 0.3, 0.4, 0.5)
-        SIGReg weights pretrained one after another by the lambda sweep.
+        There is no lambda sweep: this is the single SIGReg weight.
+    sigreg_mode : {"hinge", "isotropic"}, default="hinge"
+        ``"hinge"`` penalises only collapse (projected std below
+        ``sigreg_std_floor`` or sketched statistics beyond
+        ``sigreg_tolerance``); ``"isotropic"`` is the full Gaussian match.
+        Applied to both the global and the local path.
+    sigreg_std_floor : float, default=1.0
+        Minimum projected standard deviation of the hinge mode.
+    sigreg_tolerance : float, default=SIGREG_TOLERANCE
+        Epps-Pulley statistic allowed before the hinge mode penalises.
+    use_local_sigreg : bool, default=True
+        Add the local path: a 1x1-conv projector on P3 whose per-location
+        tokens (a random subsample per batch) are regularised by SIGReg.
+        No prediction loss is applied to tokens.
+    local_sigreg_weight : float, default=SIGREG_LAMBDA
+        Weight of the local SIGReg term.
+    tokens_per_batch : int, default=4096
+        Tokens subsampled from the P3 map of the batch for local SIGReg.
     pred_loss_mode : {"cross_camera", "intra_image"} or None
         Compatibility alias for ``prediction_pairing``.
     pooling : {"gem", "gap"}, default="gem"
-        Spatial pooling applied independently to each selected scale.
+        Spatial pooling applied independently to each selected scale. GeM uses
+        a fixed ``p`` (``gem.p_init``, 3.0) unless ``gem.learnable_p`` is
+        true, in which case ``p`` is clamped to ``[p_min, p_max]``.
     pool_cameras : tuple of int, default=(1, 2, 5, 6)
         Camera ids (as written in the file names) whose images form the pool
         of the ``"intra_image"`` mode.
     overwrite : bool, default=False
-        Retrain a lambda even when its checkpoint already exists.
-    checkpoint_dir_name : str, default="checkpoints"
-        Sub-folder of ``output_dir`` receiving the per-lambda artefacts.
+        Retrain even when the checkpoint already exists.
     sigreg_knots : int, default=17
         Integration knots of the SIGReg characteristic-function test.
     sigreg_slices : int, default=256
@@ -148,7 +163,9 @@ class PretrainConfig:
     device : str or None, default=None
         Torch device string. ``None`` picks MPS, then CUDA, then CPU.
     log_every_n_steps : int, default=0
-        Optional interval for learned-GeM logging; zero disables step logging.
+        Interval for printing the step losses and learned-GeM exponents; zero
+        disables printing. Per-step prediction/SIGReg/total losses are always
+        recorded (``step_losses.csv`` written by ``run_pretraining``).
     debug_every_n_steps : int, default=0
         Optional interval for activation debug grids; zero disables them.
     checkpoint_name : str, default="gap_lejepa_yolov8n.pth"
@@ -167,8 +184,13 @@ class PretrainConfig:
     hidden_dim: int = 256
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    lam: float = 0.2
-    lambdas: Tuple[float, ...] = DEFAULT_LAMBDAS
+    lam: float = SIGREG_LAMBDA
+    sigreg_mode: str = "hinge"
+    sigreg_std_floor: float = 1.0
+    sigreg_tolerance: float = SIGREG_TOLERANCE
+    use_local_sigreg: bool = True
+    local_sigreg_weight: float = SIGREG_LAMBDA
+    tokens_per_batch: int = 4096
     pred_loss_mode: Optional[str] = None
     prediction_pairing: str = "intra_image"
     pool_cameras: Tuple[int, ...] = (1, 2, 5, 6)
@@ -183,7 +205,6 @@ class PretrainConfig:
     log_every_n_steps: int = 0
     debug_every_n_steps: int = 0
     overwrite: bool = False
-    checkpoint_dir_name: str = "checkpoints"
     sigreg_knots: int = 17
     sigreg_slices: int = 256
     model_cfg: str = EMPTY_MODEL_CFG
@@ -202,7 +223,6 @@ class PretrainConfig:
         self.output_dir = Path(self.output_dir)
         self.cameras = tuple(int(c) for c in self.cameras)
         self.pool_cameras = tuple(int(c) for c in self.pool_cameras)
-        self.lambdas = tuple(float(v) for v in self.lambdas)
         if self.pred_loss_mode is not None and self.pred_loss_mode not in PRED_LOSS_MODES:
             raise ValueError(f"pred_loss_mode must be one of {PRED_LOSS_MODES}, got '{self.pred_loss_mode}'.")
         if self.prediction_pairing not in PREDICTION_PAIRINGS:
@@ -219,8 +239,6 @@ class PretrainConfig:
         if set(self.scale_weights) - {"p3", "p4", "p5"} or any(v < 0 for v in self.scale_weights.values()):
             raise ValueError("scale_weights must contain non-negative p3, p4 and/or p5 weights.")
         if self.pooling == "gap" and not self.pretrain_neck and not self.rotation.enabled:
-            if self.pred_loss_mode is None and self.prediction_pairing == "intra_image":
-                self.prediction_pairing = "cross_camera"
             if self.scale_weights == {"p3": 1.0, "p4": 0.0, "p5": 0.0}:
                 self.scale_weights = {"p3": 1 / 3, "p4": 1 / 3, "p5": 1 / 3}
         if not any(self.scale_weights.get(k, 0.0) > 0 for k in ("p3", "p4", "p5")):
@@ -237,8 +255,14 @@ class PretrainConfig:
         if self.log_every_n_steps < 0 or self.debug_every_n_steps < 0:
             raise ValueError("Logging and debug intervals must be non-negative.")
         validate_image_size(self.image_size)
-        if not all(0.0 <= v <= 1.0 for v in (self.lam, *self.lambdas)):
-            raise ValueError("lam and every value of lambdas must lie in [0, 1].")
+        if not 0.0 <= self.lam <= 1.0:
+            raise ValueError("lam must lie in [0, 1].")
+        if self.sigreg_mode not in SIGREG_MODES:
+            raise ValueError(f"sigreg_mode must be one of {SIGREG_MODES}, got '{self.sigreg_mode}'.")
+        if self.sigreg_std_floor <= 0 or self.sigreg_tolerance < 0:
+            raise ValueError("sigreg_std_floor must be positive and sigreg_tolerance non-negative.")
+        if self.local_sigreg_weight < 0 or self.tokens_per_batch < 2:
+            raise ValueError("local_sigreg_weight must be non-negative and tokens_per_batch at least 2.")
 
     @property
     def checkpoint_path(self) -> Path:
@@ -284,63 +308,6 @@ def validate_image_size(image_size: int, stride: int = 32) -> int:
     if image_size <= 0 or image_size % stride:
         raise ValueError(f"image size must be a positive multiple of {stride}, got {image_size}.")
     return image_size
-
-
-def lambda_tag(lam: float) -> str:
-    """Format a lambda for file and model names.
-
-    Parameters
-    ----------
-    lam : float
-        SIGReg weight.
-
-    Returns
-    -------
-    str
-        ``"0.1"`` for ``0.1`` (shortest exact form).
-    """
-    return f"{lam:g}"
-
-
-def lambda_artifact_paths(cfg: "PretrainConfig", lam: float) -> Dict[str, Path]:
-    """Paths of every artefact of one lambda run (single naming rule).
-
-    Parameters
-    ----------
-    cfg : PretrainConfig
-        Configuration providing ``output_dir`` and ``checkpoint_dir_name``.
-    lam : float
-        SIGReg weight of the run.
-
-    Returns
-    -------
-    dict of str to pathlib.Path
-        ``checkpoint`` (``backbone_lambda_<lam>.pt``), ``config``
-        (``..._config.json``) and ``history`` (``..._history.csv``), all in
-        ``output_dir / checkpoint_dir_name``.
-    """
-    folder = cfg.output_dir / cfg.checkpoint_dir_name
-    stem = f"backbone_lambda_{lambda_tag(lam)}"
-    return {"checkpoint": folder / f"{stem}.pt", "config": folder / f"{stem}_config.json",
-            "history": folder / f"{stem}_history.csv"}
-
-
-def config_for_lambda(cfg: "PretrainConfig", lam: float) -> "PretrainConfig":
-    """Copy a configuration with a different SIGReg weight.
-
-    Parameters
-    ----------
-    cfg : PretrainConfig
-        Base configuration.
-    lam : float
-        SIGReg weight of the copy.
-
-    Returns
-    -------
-    PretrainConfig
-        New configuration; ``cfg`` is unchanged.
-    """
-    return replace(cfg, lam=lam)
 
 
 def select_device(preferred: Optional[str] = None) -> torch.device:
@@ -988,6 +955,31 @@ def build_gap_projector(in_features: int, hidden_dim: int, proj_dim: int) -> nn.
     )
 
 
+def build_local_projector(in_channels: int, hidden_dim: int, proj_dim: int) -> nn.Sequential:
+    """1x1-convolution projector applied independently at every location.
+
+    Parameters
+    ----------
+    in_channels : int
+        Channels of the P3 feature map.
+    hidden_dim : int
+        Hidden width.
+    proj_dim : int
+        Token embedding width.
+
+    Returns
+    -------
+    torch.nn.Sequential
+        Maps ``(N, C, h, w)`` to ``(N, proj_dim, h, w)``.
+    """
+    return nn.Sequential(
+        nn.Conv2d(in_channels, hidden_dim, 1),
+        nn.BatchNorm2d(hidden_dim),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(hidden_dim, proj_dim, 1),
+    )
+
+
 class YOLOv8GAPEncoder(nn.Module):
     """Multi-scale YOLOv8 backbone followed by GAP and one projector per scale.
 
@@ -1003,7 +995,7 @@ class YOLOv8GAPEncoder(nn.Module):
 
     def __init__(self, model_cfg: str = EMPTY_MODEL_CFG, proj_dim: int = 128, hidden_dim: int = 256,
                  pooling: str = "gap", gem: Optional[GeMConfig] = None, pretrain_neck: bool = False,
-                 scale_weights: Optional[Dict[str, float]] = None) -> None:
+                 scale_weights: Optional[Dict[str, float]] = None, use_local_sigreg: bool = False) -> None:
         super().__init__()
         if pooling not in POOLING_MODES:
             raise ValueError(f"pooling must be one of {POOLING_MODES}, got '{pooling}'.")
@@ -1012,7 +1004,7 @@ class YOLOv8GAPEncoder(nn.Module):
         gem = gem or GeMConfig()
         self.init_kwargs = {"model_cfg": str(model_cfg), "proj_dim": proj_dim, "hidden_dim": hidden_dim,
                             "pooling": pooling, "gem": asdict(gem), "pretrain_neck": pretrain_neck,
-                            "scale_weights": scale_weights}
+                            "scale_weights": scale_weights, "use_local_sigreg": bool(use_local_sigreg)}
         self.pooling = pooling
         self.scale_weights = {str(k).lower(): float(v) for k, v in (scale_weights or
                               {"p3": 1.0, "p4": 1.0, "p5": 1.0}).items()}
@@ -1028,6 +1020,9 @@ class YOLOv8GAPEncoder(nn.Module):
             name: build_gap_projector(channels[name], hidden_dim, proj_dim)
             for name in active_scales
         })
+        # Local path: a 1x1-conv projector applied per location of P3.
+        self.local_projector = (build_local_projector(channels["P3"], hidden_dim, proj_dim)
+                                if use_local_sigreg else None)
 
     def project(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Project pooled features of a flat image batch.
@@ -1049,6 +1044,42 @@ class YOLOv8GAPEncoder(nn.Module):
             for name, feature in maps.items() if name in self.projectors
         }
         return {name: self.projectors[name](vec) for name, vec in pooled.items()}
+
+    def forward_with_tokens(self, views: torch.Tensor, tokens_per_batch: int = 4096
+                            ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Tensor]]:
+        """Global projections plus a random subsample of local P3 tokens.
+
+        Parameters
+        ----------
+        views : torch.Tensor
+            Shape ``(B, V, 3, H, W)``.
+        tokens_per_batch : int, default=4096
+            Number of per-location embeddings drawn from the whole batch.
+
+        Returns
+        -------
+        projections : dict of str to torch.Tensor
+            Same as :meth:`forward`.
+        tokens : torch.Tensor or None
+            Shape ``(K, proj_dim)`` with ``K <= tokens_per_batch``; ``None``
+            when the encoder has no local path.
+        """
+        batch, num_views = views.shape[:2]
+        maps = self.backbone(views.flatten(0, 1))
+        pooled = {
+            name: (global_average_pool(feature) if self.pooling == "gap" else self.poolers[name](feature))
+            for name, feature in maps.items() if name in self.projectors
+        }
+        projections = {name: self.projectors[name](vec).reshape(batch, num_views, -1)
+                       for name, vec in pooled.items()}
+        if self.local_projector is None:
+            return projections, None
+        tokens = self.local_projector(maps["P3"])               # (N, D, h, w)
+        tokens = tokens.permute(0, 2, 3, 1).reshape(-1, tokens.shape[1])
+        if tokens.shape[0] > tokens_per_batch:
+            keep = torch.randperm(tokens.shape[0], device=tokens.device)[:tokens_per_batch]
+            tokens = tokens[keep]
+        return projections, tokens
 
     def p_values(self) -> Dict[str, float]:
         return {name: float(module.p_value.detach().cpu()) for name, module in self.poolers.items()
@@ -1105,10 +1136,23 @@ class SIGReg(nn.Module):
         Integration points of the characteristic-function test on ``[0, 3]``.
     num_slices : int, default=256
         Random unit directions sampled per call.
+    mode : {"hinge", "isotropic"}, default="hinge"
+        ``"isotropic"`` returns the Epps-Pulley statistic (full Gaussian
+        match). ``"hinge"`` is collapse-only: it penalises a projected
+        standard deviation below ``std_floor`` and a statistic above
+        ``tolerance``, and is zero otherwise.
+    std_floor : float, default=1.0
+        Minimum per-slice standard deviation (hinge mode).
+    tolerance : float, default=SIGREG_TOLERANCE
+        Allowed slice-averaged Epps-Pulley statistic per view (hinge mode).
     """
 
-    def __init__(self, knots: int = 17, num_slices: int = 256) -> None:
+    def __init__(self, knots: int = 17, num_slices: int = 256, mode: str = "hinge",
+                 std_floor: float = 1.0, tolerance: float = SIGREG_TOLERANCE) -> None:
         super().__init__()
+        if mode not in SIGREG_MODES:
+            raise ValueError(f"mode must be one of {SIGREG_MODES}, got '{mode}'.")
+        self.mode, self.std_floor, self.tolerance = mode, float(std_floor), float(tolerance)
         t = torch.linspace(0, 3, knots)
         dt = 3 / (knots - 1)
         weights = torch.full((knots,), 2 * dt)
@@ -1154,7 +1198,8 @@ class SIGReg(nn.Module):
         #   multiply by every integration knot: (V, N, S, K)
         # Here V is the view, N the batch/sample count, S the random slice, and
         # K the number of points used to numerically integrate over t.
-        x_t = (proj @ directions).unsqueeze(-1) * self.t
+        x_proj = proj @ directions
+        x_t = x_proj.unsqueeze(-1) * self.t
         # A distribution's characteristic function is E[exp(i*t*x)]. Its
         # empirical real and imaginary parts are respectively mean(cos(t*x))
         # and mean(sin(t*x)) over the N samples. For a standard normal, the
@@ -1172,7 +1217,13 @@ class SIGReg(nn.Module):
         # region. The Epps-Pulley statistic scales the integral by N; averaging
         # the resulting values across views and random slices gives one scalar
         # regularisation loss for this batch.
-        return ((err @ self.weights) * n_samples).mean()
+        stat = (err @ self.weights) * n_samples  # (V, S)
+        if self.mode == "isotropic":
+            return stat.mean()
+        # Hinge: act only on collapse. Zero loss when every slice keeps at
+        # least `std_floor` spread and the slice-averaged statistic stays within tolerance.
+        std = x_proj.std(dim=-2, unbiased=False) if n_samples > 1 else torch.zeros_like(stat)
+        return F.relu(self.std_floor - std).square().mean() + F.relu(stat.mean(-1) - self.tolerance).mean()
 
 
 def cross_camera_prediction_loss(z: torch.Tensor, num_cameras: int) -> torch.Tensor:
@@ -1302,6 +1353,8 @@ def lejepa_loss(
     pred_loss_mode: str = "cross_camera",
     scale_weights: Optional[Dict[str, float]] = None,
     image_ids: Optional[torch.Tensor] = None,
+    tokens: Optional[torch.Tensor] = None,
+    local_sigreg_weight: float = 0.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Combine the prediction loss and SIGReg over all scales.
 
@@ -1317,13 +1370,20 @@ def lejepa_loss(
         SIGReg weight in ``[0, 1]``.
     pred_loss_mode : {"cross_camera", "intra_image"}, default="cross_camera"
         Prediction-loss variant.
+    tokens : torch.Tensor or None, default=None
+        Subsampled local token embeddings ``(K, D)``. SIGReg only; there is
+        no prediction loss on tokens.
+    local_sigreg_weight : float, default=0.0
+        Weight of the local SIGReg term.
 
     Returns
     -------
     loss : torch.Tensor
-        ``(1 - lam) * prediction + lam * sigreg`` averaged over scales.
+        ``(1 - lam) * prediction + lam * sigreg`` averaged over scales, plus
+        ``local_sigreg_weight * sigreg_local`` when ``tokens`` is given.
     logs : dict of str to torch.Tensor
-        Detached components (``total``, ``pred``, ``sigreg`` and per scale).
+        Detached components (``total``, ``pred``, ``sigreg``, ``sigreg_local``
+        when used, and per scale).
     """
     logs: Dict[str, torch.Tensor] = {}
     if scale_weights is None:
@@ -1347,6 +1407,9 @@ def lejepa_loss(
     )
     pred = sum(active_weights[name] * logs[f"pred_{name}"] for name in projections)
     sig = sum(active_weights[name] * logs[f"sigreg_{name}"] for name in projections)
+    if tokens is not None:
+        logs["sigreg_local"] = sigreg(tokens)
+        loss = loss + local_sigreg_weight * logs["sigreg_local"]
     logs.update(total=loss, pred=pred, sigreg=sig)
     # Keep the training loss attached to autograd, but detach every value saved
     # for reporting so epoch-history accumulation does not retain computation
@@ -1371,6 +1434,10 @@ def train_one_epoch(
     cfg: Optional[PretrainConfig] = None,
     global_step: int = 0,
     show_progress: bool = False,
+    use_local_sigreg: bool = False,
+    local_sigreg_weight: float = 0.0,
+    tokens_per_batch: int = 4096,
+    step_log: Optional[List[Dict[str, float]]] = None,
 ) -> Dict[str, float]:
     """Run one optimisation pass over the loader.
 
@@ -1403,6 +1470,16 @@ def train_one_epoch(
         epoch.
     show_progress : bool, default=False
         Display a batch progress bar for this epoch.
+    use_local_sigreg : bool, default=False
+        Also apply SIGReg to subsampled local P3 tokens (needs an encoder with
+        ``forward_with_tokens``).
+    local_sigreg_weight : float, default=0.0
+        Weight of the local SIGReg term.
+    tokens_per_batch : int, default=4096
+        Tokens subsampled per batch for the local term.
+    step_log : list or None, default=None
+        Receives one dict per step (``step``, ``pred``, ``sigreg``, ``total``
+        and ``sigreg_local`` when used).
 
     Returns
     -------
@@ -1421,9 +1498,16 @@ def train_one_epoch(
         views, _, image_ids = batch if len(batch) == 3 else (*batch, None)
         views = views.to(device, non_blocking=True)
         image_ids = image_ids.to(device, non_blocking=True) if image_ids is not None else None
-        loss, logs = lejepa_loss(
-            encoder(views), sigreg, num_cameras, lam, pred_loss_mode, scale_weights, image_ids
-        )
+        if use_local_sigreg:
+            projections, tokens = encoder.forward_with_tokens(views, tokens_per_batch)
+        else:
+            projections, tokens = encoder(views), None
+        if tokens is None:
+            loss, logs = lejepa_loss(projections, sigreg, num_cameras, lam, pred_loss_mode, scale_weights,
+                                     image_ids)
+        else:
+            loss, logs = lejepa_loss(projections, sigreg, num_cameras, lam, pred_loss_mode, scale_weights,
+                                     image_ids, tokens=tokens, local_sigreg_weight=local_sigreg_weight)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
@@ -1439,10 +1523,14 @@ def train_one_epoch(
             totals[key] = totals[key] + value if key in totals else value
         n_batches += 1
         global_step += 1
+        step_losses = {k: float(logs[k]) for k in ("pred", "sigreg", "sigreg_local", "total") if k in logs}
+        if step_log is not None:
+            step_log.append({"step": global_step, **step_losses})
         if cfg and cfg.log_every_n_steps and global_step % cfg.log_every_n_steps == 0:
             label = f"{desc} " if desc else ""
             print(f"{label}step={global_step} " + " ".join(f"{name}.p={value:.3f}"
-                  for name, value in encoder.p_values().items()))
+                  for name, value in encoder.p_values().items())
+                  + " " + " ".join(f"{k}={v:.4f}" for k, v in step_losses.items()))
         if cfg and cfg.debug_every_n_steps and global_step % cfg.debug_every_n_steps == 0:
             label = re.sub(r"[^A-Za-z0-9_-]+", "_", desc).strip("_")
             stem = f"p3_activation_{label}_step_{global_step:07d}" if label else \
@@ -1492,6 +1580,7 @@ def pretrain(
     loader: Optional[DataLoader] = None,
     on_epoch_end: Optional[EpochCallback] = None,
     verbose: bool = True,
+    step_log: Optional[List[Dict[str, float]]] = None,
 ) -> Tuple[YOLOv8GAPEncoder, pd.DataFrame]:
     """Pretrain an empty-weight YOLOv8 backbone with GAP LeJEPA.
 
@@ -1505,6 +1594,9 @@ def pretrain(
         Called as ``on_epoch_end(epoch, encoder, loader)`` after each epoch.
     verbose : bool, default=True
         Show a per-batch progress bar and print one summary line per epoch.
+    step_log : list or None, default=None
+        Receives per-step prediction, SIGReg and total losses (``epoch`` and a
+        run-wide ``step`` included).
 
     Returns
     -------
@@ -1524,19 +1616,26 @@ def pretrain(
         raise ValueError("Pretraining data loader contains no batches.")
     encoder = YOLOv8GAPEncoder(
         cfg.model_cfg, cfg.proj_dim, cfg.hidden_dim, cfg.pooling, cfg.gem,
-        cfg.pretrain_neck, cfg.scale_weights,
+        cfg.pretrain_neck, cfg.scale_weights, use_local_sigreg=cfg.use_local_sigreg,
     ).to(device)
-    sigreg = SIGReg(cfg.sigreg_knots, cfg.sigreg_slices).to(device)
+    sigreg = SIGReg(cfg.sigreg_knots, cfg.sigreg_slices, cfg.sigreg_mode, cfg.sigreg_std_floor,
+                    cfg.sigreg_tolerance).to(device)
     optimizer = torch.optim.AdamW(encoder.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     records = []
     for epoch in range(cfg.epochs):
+        epoch_steps: List[Dict[str, float]] = []
         stats = train_one_epoch(encoder, loader, sigreg, optimizer, len(cfg.cameras), cfg.lam, device,
                                 desc=f"Epoch {epoch + 1}/{cfg.epochs}",
                                 pred_loss_mode=cfg.prediction_pairing, scale_weights=cfg.scale_weights,
-                                cfg=cfg, show_progress=verbose)
+                                cfg=cfg, show_progress=verbose, use_local_sigreg=cfg.use_local_sigreg,
+                                local_sigreg_weight=cfg.local_sigreg_weight,
+                                tokens_per_batch=cfg.tokens_per_batch, step_log=epoch_steps)
         if not stats:
             raise ValueError("Pretraining data loader yielded no batches.")
+        if step_log is not None:
+            offset = len(step_log)
+            step_log.extend({"epoch": epoch + 1, **row, "step": offset + row["step"]} for row in epoch_steps)
         stats.update({f"p_{name.lower()}": value for name, value in encoder.p_values().items()})
         records.append({"epoch": epoch + 1, **stats})
         if verbose:
