@@ -22,6 +22,7 @@ from .core_evaluation import (
     DetectionEvalConfig,
     coco_state_dict,
     detection_init_weights,
+    display_variant_name,
     finetune_detector,
     prepare_detection_split,
     ultralytics_device,
@@ -226,9 +227,10 @@ def plot_optimization_history(studies: Dict[str, optuna.Study], out_path: Option
     for arm, study in studies.items():
         trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
         values = [t.value for t in trials]
-        line, = ax.plot([t.number for t in trials], values, "o", alpha=0.5, label=f"{arm} trials")
+        label = display_variant_name(TUNING_ARMS[arm])
+        line, = ax.plot([t.number for t in trials], values, "o", alpha=0.5, label=f"{label} trials")
         ax.plot([t.number for t in trials], np.maximum.accumulate(values) if values else [],
-                color=line.get_color(), label=f"{arm} best so far")
+                color=line.get_color(), label=f"{label} best so far")
     ax.set(xlabel="Trial", ylabel="Val mAP50-95", title="Optuna optimisation history")
     ax.grid(True, alpha=0.4)
     ax.legend(fontsize=8)

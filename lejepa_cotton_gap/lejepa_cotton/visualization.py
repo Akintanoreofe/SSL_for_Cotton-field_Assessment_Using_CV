@@ -15,7 +15,7 @@ from PIL import ImageDraw
 from sklearn.decomposition import PCA
 from ultralytics import YOLO
 
-from .core_evaluation import load_training_log, read_yolo_labels, yolo_to_xyxy
+from .core_evaluation import display_variant_name, load_training_log, read_yolo_labels, yolo_to_xyxy
 from .core_pretraining import (
     IMAGENET_MEAN, IMAGENET_STD, PretrainConfig, build_pretraining_dataset, list_images, load_rgb,
 )
@@ -226,9 +226,10 @@ def save_probe_loss_curves(histories: Dict[str, pd.DataFrame], out_path: Path) -
     """
     fig, ax = plt.subplots(figsize=(8, 5))
     for variant, history in histories.items():
-        line, = ax.plot(history["epoch"], history["train_loss"], label=f"{variant} train")
+        label = display_variant_name(variant)
+        line, = ax.plot(history["epoch"], history["train_loss"], label=f"{label} train")
         ax.plot(history["epoch"], history["test_loss"], linestyle="--", color=line.get_color(),
-                label=f"{variant} test")
+                label=f"{label} test")
     ax.set(title="Linear probe loss", xlabel="Epoch", ylabel="Cross-entropy")
     ax.grid(True, alpha=0.4)
     ax.legend()
@@ -257,7 +258,7 @@ def save_detection_curves(run_dirs: Dict[str, Path], out_path: Path,
     fig, axes = plt.subplots(1, len(metrics), figsize=(6 * len(metrics), 4), squeeze=False)
     for ax, metric in zip(axes[0], metrics):
         for variant, log in logs.items():
-            ax.plot(log["epoch"], log[metric], label=variant)
+            ax.plot(log["epoch"], log[metric], label=display_variant_name(variant))
         ax.set(title=metric, xlabel="Epoch", ylabel=metric.split("/")[-1])
         ax.grid(True, alpha=0.4)
         ax.legend()
@@ -288,7 +289,9 @@ def save_metric_bars(summary: pd.DataFrame, metrics: Sequence[str], title: str, 
     pathlib.Path
         The written file.
     """
-    ax = summary.set_index(index)[list(metrics)].T.plot.bar(figsize=figsize, rot=0)
+    indexed = summary.set_index(index)[list(metrics)].T
+    indexed.columns = [display_variant_name(variant) for variant in indexed.columns]
+    ax = indexed.plot.bar(figsize=figsize, rot=0)
     ax.set(title=title, ylabel="Score", ylim=(0, 1))
     ax.grid(True, axis="y", alpha=0.4)
     for container in ax.containers:

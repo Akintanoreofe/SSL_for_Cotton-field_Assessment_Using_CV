@@ -58,6 +58,17 @@ from .core_pretraining import (
 )
 
 VARIANTS = ("lejepa", "coco", "coco_backbone", "scratch")
+VARIANT_DISPLAY_NAMES = {
+    "lejepa": "Cotton Field–Pretrained LeJEPA Backbone",
+    "coco": "COCO-Pretrained Backbone (full model)",
+    "coco_backbone": "COCO-Pretrained Backbone",
+    "scratch": "Scratch Backbone",
+}
+
+
+def display_variant_name(variant: str) -> str:
+    """Return a human-readable backbone label for a comparison variant."""
+    return VARIANT_DISPLAY_NAMES.get(variant, variant)
 
 
 # --------------------------------------------------------------------------- #

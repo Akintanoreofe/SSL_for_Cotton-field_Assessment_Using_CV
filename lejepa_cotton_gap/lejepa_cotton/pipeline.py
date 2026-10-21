@@ -23,6 +23,7 @@ from .core_evaluation import (
     classification_summary,
     detection_init_weights,
     coco_state_dict,
+    display_variant_name,
     extract_embeddings,
     finetune_detector,
     fit_probe_variant,
@@ -285,13 +286,14 @@ def run_probe_evaluation(cfg: ProbeEvalConfig) -> pd.DataFrame:
         rows.append({"variant": variant, "accuracy": summary["accuracy"], "macro_f1": summary["macro_f1"]})
 
         histories[variant].to_csv(cfg.output_dir / f"probe_history_{variant}.csv", index=False)
-        save_confusion_matrix(summary["confusion"], cfg.class_names, f"{variant}: confusion matrix",
+        display_name = display_variant_name(variant)
+        save_confusion_matrix(summary["confusion"], cfg.class_names, f"{display_name}: confusion matrix",
                               plots_dir / f"confusion_{variant}.png")
         features, feature_labels = extract_embeddings(probe, test_loader)
         names = [cfg.class_names[i] for i in feature_labels]
-        save_pca_2d(features, names, f"{variant}: GAP features (test)", plots_dir / f"pca2d_{variant}.png",
+        save_pca_2d(features, names, f"{display_name}: GAP features (test)", plots_dir / f"pca2d_{variant}.png",
                     legend_title="plot status")
-        save_pca_3d(features, names, f"{variant}: GAP features (test)", plots_dir / f"pca3d_{variant}.html",
+        save_pca_3d(features, names, f"{display_name}: GAP features (test)", plots_dir / f"pca3d_{variant}.html",
                     legend_title="plot status")
 
     summary_frame = pd.DataFrame(rows)
