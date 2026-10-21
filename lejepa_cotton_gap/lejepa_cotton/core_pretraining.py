@@ -49,8 +49,6 @@ POOLING_MODES = ("gem", "gap")
 TRANSFER_MODES = ("backbone", "backbone+neck")
 PREDICTION_PAIRINGS = ("intra_image", "cross_camera")
 SIGREG_LAMBDA = 0.05  # the single SIGReg weight; the only place it is defined
-SIGREG_MODES = ("hinge", "isotropic")
-SIGREG_TOLERANCE = 2.0  # Epps-Pulley statistic (scaled by N; ~1 for Gaussian data) tolerated by hinge mode
 DEFAULT_IMAGE_SIZE = 640
 
 CameraGroup = Dict[int, Path]
@@ -119,15 +117,6 @@ class PretrainConfig:
     lam : float, default=SIGREG_LAMBDA (0.05)
         Weight of SIGReg; the prediction loss is weighted by ``1 - lam``.
         There is no lambda sweep: this is the single SIGReg weight.
-    sigreg_mode : {"hinge", "isotropic"}, default="hinge"
-        ``"hinge"`` penalises only collapse (projected std below
-        ``sigreg_std_floor`` or sketched statistics beyond
-        ``sigreg_tolerance``); ``"isotropic"`` is the full Gaussian match.
-        Applied to both the global and the local path.
-    sigreg_std_floor : float, default=1.0
-        Minimum projected standard deviation of the hinge mode.
-    sigreg_tolerance : float, default=SIGREG_TOLERANCE
-        Epps-Pulley statistic allowed before the hinge mode penalises.
     use_local_sigreg : bool, default=True
         Add the local path: a 1x1-conv projector on P3 whose per-location
         tokens (a random subsample per batch) are regularised by SIGReg.
@@ -185,9 +174,6 @@ class PretrainConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     lam: float = SIGREG_LAMBDA
-    sigreg_mode: str = "hinge"
-    sigreg_std_floor: float = 1.0
-    sigreg_tolerance: float = SIGREG_TOLERANCE
     use_local_sigreg: bool = True
     local_sigreg_weight: float = SIGREG_LAMBDA
     tokens_per_batch: int = 4096
@@ -257,10 +243,6 @@ class PretrainConfig:
         validate_image_size(self.image_size)
         if not 0.0 <= self.lam <= 1.0:
             raise ValueError("lam must lie in [0, 1].")
-        if self.sigreg_mode not in SIGREG_MODES:
-            raise ValueError(f"sigreg_mode must be one of {SIGREG_MODES}, got '{self.sigreg_mode}'.")
-        if self.sigreg_std_floor <= 0 or self.sigreg_tolerance < 0:
-            raise ValueError("sigreg_std_floor must be positive and sigreg_tolerance non-negative.")
         if self.local_sigreg_weight < 0 or self.tokens_per_batch < 2:
             raise ValueError("local_sigreg_weight must be non-negative and tokens_per_batch at least 2.")
 
@@ -1136,23 +1118,10 @@ class SIGReg(nn.Module):
         Integration points of the characteristic-function test on ``[0, 3]``.
     num_slices : int, default=256
         Random unit directions sampled per call.
-    mode : {"hinge", "isotropic"}, default="hinge"
-        ``"isotropic"`` returns the Epps-Pulley statistic (full Gaussian
-        match). ``"hinge"`` is collapse-only: it penalises a projected
-        standard deviation below ``std_floor`` and a statistic above
-        ``tolerance``, and is zero otherwise.
-    std_floor : float, default=1.0
-        Minimum per-slice standard deviation (hinge mode).
-    tolerance : float, default=SIGREG_TOLERANCE
-        Allowed slice-averaged Epps-Pulley statistic per view (hinge mode).
     """
 
-    def __init__(self, knots: int = 17, num_slices: int = 256, mode: str = "hinge",
-                 std_floor: float = 1.0, tolerance: float = SIGREG_TOLERANCE) -> None:
+    def __init__(self, knots: int = 17, num_slices: int = 256) -> None:
         super().__init__()
-        if mode not in SIGREG_MODES:
-            raise ValueError(f"mode must be one of {SIGREG_MODES}, got '{mode}'.")
-        self.mode, self.std_floor, self.tolerance = mode, float(std_floor), float(tolerance)
         t = torch.linspace(0, 3, knots)
         dt = 3 / (knots - 1)
         weights = torch.full((knots,), 2 * dt)
@@ -1198,8 +1167,7 @@ class SIGReg(nn.Module):
         #   multiply by every integration knot: (V, N, S, K)
         # Here V is the view, N the batch/sample count, S the random slice, and
         # K the number of points used to numerically integrate over t.
-        x_proj = proj @ directions
-        x_t = x_proj.unsqueeze(-1) * self.t
+        x_t = (proj @ directions).unsqueeze(-1) * self.t
         # A distribution's characteristic function is E[exp(i*t*x)]. Its
         # empirical real and imaginary parts are respectively mean(cos(t*x))
         # and mean(sin(t*x)) over the N samples. For a standard normal, the
@@ -1217,13 +1185,7 @@ class SIGReg(nn.Module):
         # region. The Epps-Pulley statistic scales the integral by N; averaging
         # the resulting values across views and random slices gives one scalar
         # regularisation loss for this batch.
-        stat = (err @ self.weights) * n_samples  # (V, S)
-        if self.mode == "isotropic":
-            return stat.mean()
-        # Hinge: act only on collapse. Zero loss when every slice keeps at
-        # least `std_floor` spread and the slice-averaged statistic stays within tolerance.
-        std = x_proj.std(dim=-2, unbiased=False) if n_samples > 1 else torch.zeros_like(stat)
-        return F.relu(self.std_floor - std).square().mean() + F.relu(stat.mean(-1) - self.tolerance).mean()
+        return ((err @ self.weights) * n_samples).mean()
 
 
 def cross_camera_prediction_loss(z: torch.Tensor, num_cameras: int) -> torch.Tensor:
@@ -1618,8 +1580,7 @@ def pretrain(
         cfg.model_cfg, cfg.proj_dim, cfg.hidden_dim, cfg.pooling, cfg.gem,
         cfg.pretrain_neck, cfg.scale_weights, use_local_sigreg=cfg.use_local_sigreg,
     ).to(device)
-    sigreg = SIGReg(cfg.sigreg_knots, cfg.sigreg_slices, cfg.sigreg_mode, cfg.sigreg_std_floor,
-                    cfg.sigreg_tolerance).to(device)
+    sigreg = SIGReg(cfg.sigreg_knots, cfg.sigreg_slices).to(device)
     optimizer = torch.optim.AdamW(encoder.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     records = []

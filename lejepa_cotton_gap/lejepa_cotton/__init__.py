@@ -4,7 +4,7 @@ Modules
 -------
 core_pretraining
     Multi-camera data, empty-weight YOLOv8 GAP encoder, SIGReg, both
-    prediction losses (cross-camera and intra-image), single-weight SIGReg (hinge or isotropic),
+    prediction losses (cross-camera and intra-image), single-weight SIGReg,
     training loop, checkpoint I/O and export to Ultralytics.
 core_evaluation
     Detection fine-tuning and frozen-backbone linear probing that compare the

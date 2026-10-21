@@ -345,21 +345,9 @@ def test_defaults_match_new_pretraining_spec(tmp_path):
     cfg = PretrainConfig(image_root=tmp_path, output_dir=tmp_path)
     assert core_pretraining.SIGREG_LAMBDA == cfg.lam == 0.05
     assert cfg.prediction_pairing == "intra_image"
-    assert cfg.sigreg_mode == "hinge" and cfg.sigreg_std_floor == 1.0
     assert cfg.use_local_sigreg and cfg.tokens_per_batch == 4096
     assert cfg.gem.p_init == 3.0 and not cfg.gem.learnable_p
     assert not hasattr(cfg, "lambdas")
-
-
-def test_hinge_sigreg_is_zero_for_gaussian_and_penalises_collapse():
-    torch.manual_seed(0)
-    hinge = SIGReg(17, 64, mode="hinge", std_floor=0.5)
-    iso = SIGReg(17, 64, mode="isotropic")
-    healthy = torch.randn(512, 16)
-    collapsed = torch.zeros(512, 16) + 0.01 * torch.randn(512, 16)
-    assert hinge(healthy).item() == 0.0
-    assert hinge(collapsed).item() > 0.1
-    assert iso(healthy).item() > 0.0
 
 
 def test_local_path_samples_tokens_and_logs_local_sigreg():
@@ -369,7 +357,7 @@ def test_local_path_samples_tokens_and_logs_local_sigreg():
     views = torch.randn(2, 2, 3, 64, 64)
     projections, tokens = encoder.forward_with_tokens(views, tokens_per_batch=50)
     assert tokens.shape == (50, 128)
-    loss, logs = lejepa_loss(projections, SIGReg(5, 16, mode="isotropic"), 2, 0.05, "intra_image",
+    loss, logs = lejepa_loss(projections, SIGReg(5, 16), 2, 0.05, "intra_image",
                              {"p3": 1.0}, torch.tensor([[0, 0], [1, 1]]), tokens=tokens, local_sigreg_weight=0.05)
     assert "sigreg_local" in logs
     loss.backward()

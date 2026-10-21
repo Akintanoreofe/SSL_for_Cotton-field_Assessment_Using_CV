@@ -24,7 +24,6 @@ if __name__ == "__main__":
         image_size=640,
         batch_size=16,
         epochs=100,
-        sigreg_mode="hinge",
     )
     weights = WeightSources(lejepa_checkpoint=pretrain_cfg.checkpoint_path)
 

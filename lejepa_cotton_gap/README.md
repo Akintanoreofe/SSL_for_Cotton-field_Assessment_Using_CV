@@ -54,7 +54,7 @@ Python ≥ 3.9, PyTorch ≥ 2.0, torchvision ≥ 0.16, Ultralytics ≥ 8.1.
 **Objective** (weighted sum across enabled scales):
 
 - *Intra-image prediction loss* (default): each view is regressed toward the mean embedding of the same source image's global views. Optional `prediction_pairing="cross_camera"` retains the previous synchronized-camera objective.
-- *SIGReg* (`sigreg_mode`): `"hinge"` (default) is collapse-only — it penalises a projected std below `sigreg_std_floor` (1.0) or a sliced Epps–Pulley statistic above `sigreg_tolerance`, and is zero otherwise; `"isotropic"` pushes the embeddings toward an isotropic Gaussian (previous behaviour). The mode applies to both paths.
+- *SIGReg*: a sliced Epps–Pulley test pushes the embedding distribution toward an isotropic Gaussian, which prevents collapse. It is applied to both the global and local paths.
 - *Local path* (`use_local_sigreg=True`): a 1×1-conv projector on P3 gives per-location tokens; SIGReg is applied to `tokens_per_batch` (4096) randomly sampled tokens, weighted by `local_sigreg_weight`. No prediction loss on tokens. `use_local_sigreg=False` disables it.
 - `loss = Σ_s scale_weight_s · ((1 − λ)·prediction_s + λ·SIGReg_s) + local_sigreg_weight·SIGReg_local`, with the single weight `SIGREG_LAMBDA = 0.05` (defined once in `core_pretraining`; no sweep).
 - Per-step prediction / SIGReg / total losses are written to `step_losses.csv`; `log_every_n_steps` also prints them. Zero-weight scales are skipped entirely; SIGReg is evaluated over the full set of view embeddings at every active scale.
@@ -142,7 +142,7 @@ python -m lejepa_cotton.predict_video --weights outputs/detection/runs/lejepa/we
 
 ## Pretraining options and Optuna tuning
 
-`PretrainConfig` options: `epochs=100`, `image_size=640` (multiple of 32, shared with detection), `pooling="gem"` or `"gap"`, `prediction_pairing="intra_image"` (default) or `"cross_camera"`, `sigreg_mode="hinge"` or `"isotropic"`, `use_local_sigreg`, `local_sigreg_weight`, `tokens_per_batch`, `pool_cameras=(1, 2, 5, 6)`. The legacy `pred_loss_mode` argument remains a compatibility alias.
+`PretrainConfig` options: `epochs=100`, `image_size=640` (multiple of 32, shared with detection), `pooling="gem"` or `"gap"`, `prediction_pairing="intra_image"` (default) or `"cross_camera"`, `use_local_sigreg`, `local_sigreg_weight`, `tokens_per_batch`, `pool_cameras=(1, 2, 5, 6)`. The legacy `pred_loss_mode` argument remains a compatibility alias.
 
 ```python
 from lejepa_cotton import (PretrainConfig, DetectionEvalConfig, WeightSources, TuningConfig,
