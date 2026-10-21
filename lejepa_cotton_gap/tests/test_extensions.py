@@ -269,7 +269,8 @@ def test_neck_returns_detect_scales_at_expected_strides():
 
 def test_gap_backbone_legacy_config_uses_all_scales_and_cross_camera(tmp_path):
     cfg = PretrainConfig(image_root=tmp_path, output_dir=tmp_path, pooling="gap",
-                         pretrain_neck=False, rotation={"enabled": False})
+                         pretrain_neck=False, rotation={"enabled": False},
+                         prediction_pairing="cross_camera")
     assert cfg.log_every_n_steps == cfg.debug_every_n_steps == 0
     assert cfg.prediction_pairing == "cross_camera"
     assert cfg.scale_weights == {"p3": 1 / 3, "p4": 1 / 3, "p5": 1 / 3}
@@ -338,3 +339,40 @@ def test_predict_video_writes_video_and_csv(tmp_path):
         rows = list(csv.DictReader(handle))
     assert len(rows) == 2
     assert {"frame_idx", "timestamp_s", "n_bolls", "mean_conf"} <= rows[0].keys()
+
+
+def test_defaults_match_new_pretraining_spec(tmp_path):
+    cfg = PretrainConfig(image_root=tmp_path, output_dir=tmp_path)
+    assert core_pretraining.SIGREG_LAMBDA == cfg.lam == 0.05
+    assert cfg.prediction_pairing == "intra_image"
+    assert cfg.use_local_sigreg and cfg.tokens_per_batch == 4096
+    assert cfg.gem.p_init == 3.0 and not cfg.gem.learnable_p
+    assert not hasattr(cfg, "lambdas")
+
+
+def test_local_path_samples_tokens_and_logs_local_sigreg():
+    torch.manual_seed(0)
+    encoder = YOLOv8GAPEncoder(pooling="gem", pretrain_neck=True, scale_weights={"p3": 1.0, "p4": 0.0, "p5": 0.0},
+                               use_local_sigreg=True)
+    views = torch.randn(2, 2, 3, 64, 64)
+    projections, tokens = encoder.forward_with_tokens(views, tokens_per_batch=50)
+    assert tokens.shape == (50, 128)
+    loss, logs = lejepa_loss(projections, SIGReg(5, 16), 2, 0.05, "intra_image",
+                             {"p3": 1.0}, torch.tensor([[0, 0], [1, 1]]), tokens=tokens, local_sigreg_weight=0.05)
+    assert "sigreg_local" in logs
+    loss.backward()
+    assert encoder.local_projector[0].weight.grad is not None
+
+
+def test_tuning_search_space_and_params():
+    import optuna
+    from lejepa_cotton.tuning import apply_params, suggest_params
+    trial = optuna.create_study().ask()
+    params = suggest_params(trial)
+    assert set(params) == {"lr0", "lrf", "weight_decay", "optimizer", "warmup_epochs",
+                           "freeze_backbone_epochs", "backbone_lr_mult", "mosaic", "close_mosaic", "mixup"}
+    from lejepa_cotton import DetectionEvalConfig, WeightSources
+    cfg = DetectionEvalConfig("a", "b", WeightSources("c.pth"))
+    out = apply_params(cfg, params, 30, seed=3)
+    assert out.epochs == 30 and out.seed == 3
+    assert out.train_overrides["mosaic"] == params["mosaic"]

@@ -23,6 +23,7 @@ setup(
         "torchvision>=0.16",
         "ultralytics>=8.1",
         "numpy",
+        "optuna",
         "pandas",
         "scikit-learn",
         "matplotlib",

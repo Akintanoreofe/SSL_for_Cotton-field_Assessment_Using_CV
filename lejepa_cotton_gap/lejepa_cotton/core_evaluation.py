@@ -31,7 +31,7 @@ from copy import deepcopy
 from functools import partial
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -437,8 +437,9 @@ def prepare_detection_split(
     max_train_images: Optional[int] = 200,
     seed: int = 42,
     split_by: str = "image",
+    test_ratio: float = 0.0,
 ) -> Path:
-    """Create a fresh train/val split and its Ultralytics ``dataset.yaml``.
+    """Create a fresh train/val(/test) split and its Ultralytics ``dataset.yaml``.
 
     Parameters
     ----------
@@ -459,6 +460,9 @@ def prepare_detection_split(
         Seed for subsetting and splitting.
     split_by : {"image", "folder"}, default="image"
         Split strategy, see :func:`split_pairs`.
+    test_ratio : float, default=0.0
+        Fraction of the data held out as a test split (never used for tuning).
+        ``val_ratio`` and ``test_ratio`` are both fractions of the full data.
 
     Returns
     -------
@@ -471,12 +475,19 @@ def prepare_detection_split(
     if split_dir.exists():
         shutil.rmtree(split_dir)
     pairs = find_labeled_pairs(source_dir)
+    test_pairs: list = []
+    if test_ratio > 0:
+        if val_ratio + test_ratio >= 1:
+            raise ValueError("val_ratio and test_ratio must leave data for training.")
+        pairs, test_pairs = split_pairs(pairs, source_dir, test_ratio, seed, split_by)
+        val_ratio = val_ratio / (1.0 - test_ratio)
     train_pairs, val_pairs = split_pairs(pairs, source_dir, val_ratio, seed, split_by)
     available = len(train_pairs)
     train_pairs = subsample(train_pairs, max_train_images, seed)
     print(f"Training images: {len(train_pairs)} of {available} available")
     single_class = len(class_names) == 1
-    for name, subset in (("train", train_pairs), ("val", val_pairs)):
+    splits = [("train", train_pairs), ("val", val_pairs)] + ([("test", test_pairs)] if test_pairs else [])
+    for name, subset in splits:
         copy_pairs(subset, source_dir, split_dir / "images" / name, split_dir / "labels" / name, single_class)
     print(f"Detection split: {len(train_pairs)} train | {len(val_pairs)} val -> {split_dir}")
 
@@ -485,6 +496,7 @@ def prepare_detection_split(
         "path": str(split_dir.resolve()),
         "train": "images/train",
         "val": "images/val",
+        **({"test": "images/test"} if test_pairs else {}),
         "names": dict(enumerate(class_names)),
     }))
     return yaml_path
@@ -513,6 +525,8 @@ class DetectionEvalConfig:
         ``"coco"`` for the fully COCO-pretrained reference.
     val_ratio : float, default=0.2
         Validation fraction.
+    test_ratio : float, default=0.0
+        Held-out test fraction (used only by final reporting, never tuning).
     max_train_images : int or None, default=200
         Training images used for fine-tuning, drawn after the split so the
         validation set stays fixed; ``None`` uses all of them.
@@ -564,6 +578,7 @@ class DetectionEvalConfig:
     class_names: Tuple[str, ...] = ("cotton_boll",)
     variants: Tuple[str, ...] = ("lejepa", "coco_backbone")
     val_ratio: float = 0.2
+    test_ratio: float = 0.0
     max_train_images: Optional[int] = 200
     split_by: str = "image"
     image_size: int = 640
@@ -863,7 +878,9 @@ def apply_backbone_freeze_warmup(trainer, freeze_epochs: int) -> None:
 def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConfig,
                       run_name: str, device: str,
                       coco_state: Optional[Dict[str, torch.Tensor]] = None,
-                      audit_variant: Optional[str] = None) -> Tuple[Path, Dict[str, float]]:
+                      audit_variant: Optional[str] = None,
+                      epoch_callback: Optional[Callable[[int, Dict[str, float]], None]] = None
+                      ) -> Tuple[Path, Dict[str, float]]:
     """Fine-tune a YOLOv8 detector, auditing its starting weights.
 
     When ``coco_state`` is given, the model Ultralytics trains is compared
@@ -889,6 +906,11 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
         Variant whose expected initialisation is checked; defaults to
         ``run_name``.
 
+    epoch_callback : callable or None, default=None
+        Called as ``epoch_callback(epoch, metrics)`` after each epoch's
+        validation (``metrics`` is the Ultralytics metrics dictionary); it may
+        raise to stop training (used for pruning).
+
     Returns
     -------
     run_dir : pathlib.Path
@@ -904,6 +926,9 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
     if cfg.freeze_backbone_epochs:
         model.add_callback("on_train_epoch_start", partial(apply_backbone_freeze_warmup,
                                                             freeze_epochs=cfg.freeze_backbone_epochs))
+    if epoch_callback is not None:
+        model.add_callback("on_fit_epoch_end",
+                           lambda trainer: epoch_callback(int(trainer.epoch), dict(trainer.metrics)))
     if coco_state is not None:
         model.add_callback("on_train_start", partial(record_initialisation, variant=audit_variant or run_name,
                                                      coco_state=coco_state, report=init_report))
@@ -919,8 +944,8 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
 
 
 def validate_detector(weights: Path, data_yaml: Path, cfg: DetectionEvalConfig,
-                      run_name: str, device: str) -> Dict[str, float]:
-    """Compute detection metrics on the validation split.
+                      run_name: str, device: str, split: str = "val") -> Dict[str, float]:
+    """Compute detection metrics on the validation (or test) split.
 
     The default low confidence threshold of Ultralytics is kept so mAP is
     integrated over the full precision-recall curve.
@@ -937,6 +962,8 @@ def validate_detector(weights: Path, data_yaml: Path, cfg: DetectionEvalConfig,
         Name of the validation output folder.
     device : str
         Ultralytics device string.
+    split : {"val", "test"}, default="val"
+        Split to score.
 
     Returns
     -------
@@ -945,7 +972,7 @@ def validate_detector(weights: Path, data_yaml: Path, cfg: DetectionEvalConfig,
     """
     metrics = YOLO(str(weights)).val(
         data=str(data_yaml), imgsz=cfg.image_size, batch=cfg.batch_size, device=device,
-        split="val", plots=False, project=str(cfg.runs_dir), name=f"{run_name}_val", exist_ok=True,
+        split=split, plots=False, project=str(cfg.runs_dir), name=f"{run_name}_{split}", exist_ok=True,
     )
     box = metrics.box
     return {"precision": float(box.mp), "recall": float(box.mr),

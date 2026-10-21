@@ -4,7 +4,7 @@ Modules
 -------
 core_pretraining
     Multi-camera data, empty-weight YOLOv8 GAP encoder, SIGReg, both
-    prediction losses (cross-camera and intra-image), lambda-sweep helpers,
+    prediction losses (cross-camera and intra-image), single-weight SIGReg,
     training loop, checkpoint I/O and export to Ultralytics.
 core_evaluation
     Detection fine-tuning and frozen-backbone linear probing that compare the
@@ -46,7 +46,6 @@ from .core_pretraining import (
     intra_image_prediction_loss,
     global_average_pool,
     lejepa_loss,
-    lambda_artifact_paths,
     export_backbone_to_yolo,
     load_backbone,
     load_encoder,
@@ -55,15 +54,20 @@ from .core_pretraining import (
     select_device,
 )
 from .pipeline import (
-    plot_lambda_losses,
     run_all,
     run_detection_evaluation,
-    run_lambda_evaluation,
-    run_lambda_sweep,
     run_pretraining,
     run_probe_evaluation,
 )
 from .predict_video import predict_video
+from .tuning import (
+    TuningConfig,
+    plot_optimization_history,
+    print_best_params,
+    retrain_best,
+    run_tuning,
+    summary_table,
+)
 
 __version__ = "0.1.0"
 
@@ -89,10 +93,12 @@ __all__ = [
     "intra_image_prediction_loss",
     "global_average_pool",
     "lejepa_loss",
-    "lambda_artifact_paths",
-    "plot_lambda_losses",
-    "run_lambda_evaluation",
-    "run_lambda_sweep",
+    "TuningConfig",
+    "plot_optimization_history",
+    "print_best_params",
+    "retrain_best",
+    "run_tuning",
+    "summary_table",
     "discover_camera_groups",
     "export_backbone_to_yolo",
     "PlotStatusDataset",
