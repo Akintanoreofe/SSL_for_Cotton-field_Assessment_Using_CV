@@ -2,7 +2,7 @@
 
 Two protocols are provided, both parameterised by a *variant* name:
 
-``"lejepa"``
+``"lejepa_backbone"``
     Backbone from a LeJEPA checkpoint, with neck transfer controlled by its
     saved pretraining configuration; the Detect head remains random.
 ``"coco"``
