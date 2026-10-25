@@ -7,6 +7,7 @@ import torch
 from ultralytics import YOLO
 
 from lejepa_cotton import core_pretraining
+from lejepa_cotton import core_evaluation
 from lejepa_cotton import (
     GeM,
     PretrainConfig,
@@ -376,3 +377,14 @@ def test_tuning_search_space_and_params():
     out = apply_params(cfg, params, 30, seed=3)
     assert out.epochs == 30 and out.seed == 3
     assert out.train_overrides["mosaic"] == params["mosaic"]
+
+
+def test_coco_state_dict_explains_local_weights_fallback(monkeypatch):
+    from lejepa_cotton import WeightSources
+
+    def fail_to_download(_weights):
+        raise ConnectionError("download failed")
+
+    monkeypatch.setattr(core_evaluation, "YOLO", fail_to_download)
+    with pytest.raises(ConnectionError, match="coco_weights='/path/to/yolov8n.pt'"):
+        core_evaluation.coco_state_dict(WeightSources("encoder.pth"))

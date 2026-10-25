@@ -75,6 +75,8 @@ class WeightSources:
         Empty-weight architecture definition.
     coco_weights : str, default="yolov8n.pt"
         Ultralytics COCO checkpoint (downloaded automatically if missing).
+        Set this to a local ``.pt`` path to use a previously downloaded
+        checkpoint or to work offline.
     """
 
     lejepa_checkpoint: Path
@@ -128,7 +130,7 @@ def build_backbone_for_variant(variant: str, sources: WeightSources) -> YOLOv8Mu
         return load_backbone(sources.lejepa_checkpoint)
     if variant == "scratch":
         return YOLOv8MultiScaleBackbone(sources.model_cfg)
-    return YOLOv8MultiScaleBackbone(sources.coco_weights)
+    return YOLOv8MultiScaleBackbone(str(sources.coco_weights))
 
 
 def ultralytics_device(device: torch.device) -> str:
@@ -725,7 +727,15 @@ def coco_state_dict(sources: WeightSources) -> Dict[str, torch.Tensor]:
     dict of str to torch.Tensor
         CPU copy of the COCO detector state dictionary.
     """
-    return {k: v.detach().cpu().clone() for k, v in YOLO(str(sources.coco_weights)).model.state_dict().items()}
+    try:
+        model = YOLO(str(sources.coco_weights))
+    except ConnectionError as exc:
+        raise ConnectionError(
+            f"Could not load COCO weights {sources.coco_weights!r}; Ultralytics could not download them. "
+            "Download yolov8n.pt manually and pass its local path as "
+            "WeightSources(..., coco_weights='/path/to/yolov8n.pt') to run without network access."
+        ) from exc
+    return {k: v.detach().cpu().clone() for k, v in model.model.state_dict().items()}
 
 
 def detector_part(layer_index: int, num_layers: int, backbone_layers: int = 10) -> str:
