@@ -104,6 +104,8 @@ det = DetectionEvalConfig(source_dir="path/to/image_dataset", output_dir="output
 summary = run_detection_evaluation(det)
 ```
 
+Ultralytics downloads the default `yolov8n.pt` COCO checkpoint when needed. If that download is unavailable, download the checkpoint separately and pass its local path with `WeightSources(lejepa_checkpoint=ckpt, coco_weights="path/to/yolov8n.pt")`. The notebook exposes the same setting as `COCO_WEIGHTS`.
+
 ## Pretraining configuration examples
 
 The dataclasses below expose the same options used in the notebook. The first example reproduces the legacy GAP/backbone/cross-camera behavior; the second is the GeM + neck + P3 default.
@@ -153,7 +155,8 @@ pre = PretrainConfig(image_root="path/to/mars_multi_camera_boll", output_dir="ou
 run_pretraining(pre)
 
 det = DetectionEvalConfig(source_dir="path/to/image_dataset", output_dir="outputs/detection",
-                          weights=WeightSources(lejepa_checkpoint=pre.checkpoint_path),
+                          weights=WeightSources(lejepa_checkpoint=pre.checkpoint_path,
+                                                coco_weights="yolov8n.pt"),
                           val_ratio=0.2, test_ratio=0.2)
 tcfg = TuningConfig(n_trials=20)           # 30-epoch proxy trials, same budget for both arms
 studies = run_tuning(det, tcfg)            # TPE + median pruner, val mAP50-95; resumable (SQLite)
