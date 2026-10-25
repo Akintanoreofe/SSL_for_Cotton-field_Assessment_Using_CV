@@ -42,6 +42,7 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from torch.utils.data import DataLoader, Dataset, Subset
 from ultralytics import YOLO
+from ultralytics.utils.tal import TaskAlignedAssigner
 
 from .core_pretraining import (
     EMPTY_MODEL_CFG,
@@ -131,6 +132,27 @@ def build_backbone_for_variant(variant: str, sources: WeightSources) -> YOLOv8Mu
     if variant == "scratch":
         return YOLOv8MultiScaleBackbone(sources.model_cfg)
     return YOLOv8MultiScaleBackbone(str(sources.coco_weights))
+
+
+def run_assigner_on_cpu() -> None:
+    """Run the Ultralytics task-aligned assigner on the CPU (idempotent).
+
+    Masked indexing in the assigner returns inconsistent sizes on Apple MPS
+    ("shape mismatch: value tensor ... cannot be broadcast"), so its inputs are
+    moved to the CPU and the targets moved back; the network stays on the GPU.
+    """
+    if getattr(TaskAlignedAssigner.forward, "_cpu_patched", False):
+        return
+    original = TaskAlignedAssigner.forward
+
+    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+        device = pd_scores.device
+        outputs = original(self, *(t.cpu() for t in (pd_scores, pd_bboxes, anc_points, gt_labels,
+                                                      gt_bboxes, mask_gt)))
+        return tuple(t.to(device) for t in outputs)
+
+    forward._cpu_patched = True
+    TaskAlignedAssigner.forward = forward
 
 
 def ultralytics_device(device: torch.device) -> str:
@@ -928,6 +950,8 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
     init_report : dict of str to float
         Share of tensors identical to COCO per part (empty without audit).
     """
+    if str(device) == "mps":
+        run_assigner_on_cpu()
     model = YOLO(init_weights)
     init_report: Dict[str, float] = {}
     if cfg.backbone_lr_mult != 1.0:

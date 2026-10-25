@@ -136,8 +136,16 @@ def tune_arm(cfg: DetectionEvalConfig, data_yaml: Path, arm: str, tcfg: TuningCo
                 raise optuna.TrialPruned()
 
         name = f"tune_{arm}_trial{trial.number:03d}"
-        run_dir, _ = finetune_detector(init, data_yaml, trial_cfg, name, device, coco_state,
-                                       TUNING_ARMS[arm], epoch_callback=report)
+        try:
+            run_dir, _ = finetune_detector(init, data_yaml, trial_cfg, name, device, coco_state,
+                                           TUNING_ARMS[arm], epoch_callback=report)
+        except RuntimeError as error:
+            # Diverged (NaN) predictions or MPS masked-assignment bugs break the TAL assigner.
+            if "shape mismatch" not in str(error):
+                raise
+            print(f"Trial {trial.number} pruned: assigner shape mismatch ({error}). "
+                  "If this repeats, set DetectionEvalConfig.device='cpu' or lower lr0.")
+            raise optuna.TrialPruned() from error
         return validate_detector(run_dir / "weights" / "best.pt", data_yaml, trial_cfg, name, device,
                                  split="val")["mAP50-95"]
 
