@@ -41,8 +41,10 @@ class TuningConfig:
 
     Parameters
     ----------
-    n_trials : int, default=20
+    n_trials : int, default=40
         Finished trials (complete, pruned or failed) per arm; identical for both.
+    prune_percentile : float, default=33
+        Percentile threshold used by the pruning algorithm.
     proxy_epochs : int, default=30
         Epochs per tuning trial.
     final_epochs : int, default=120
@@ -52,15 +54,16 @@ class TuningConfig:
     sampler_seed : int, default=42
         Seed of the TPE sampler (same for both arms).
     n_startup_trials, n_warmup_steps : int
-        Median-pruner settings.
+        Percentile-pruner settings.
     """
 
-    n_trials: int = 20
+    n_trials: int = 40
     proxy_epochs: int = 30
     final_epochs: int = 120
     seeds: Tuple[int, ...] = (0, 1, 2)
     sampler_seed: int = 42
-    n_startup_trials: int = 5
+    prune_percentile: float = 33
+    n_startup_trials: int = 4
     n_warmup_steps: int = 5
 
 
@@ -102,12 +105,15 @@ def study_storage(cfg: DetectionEvalConfig) -> str:
 
 
 def load_study(cfg: DetectionEvalConfig, arm: str, tcfg: TuningConfig) -> optuna.Study:
-    """Create or resume the persisted study of an arm (TPE + median pruner)."""
+    """Create or resume the persisted study of an arm (TPE + percentile pruner)."""
     return optuna.create_study(
         study_name=f"{arm}", storage=study_storage(cfg), direction="maximize", load_if_exists=True,
         sampler=optuna.samplers.TPESampler(seed=tcfg.sampler_seed),
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=tcfg.n_startup_trials,
-                                           n_warmup_steps=tcfg.n_warmup_steps),
+        pruner=optuna.pruners.PercentilePruner(
+            percentile=tcfg.prune_percentile,
+            n_startup_trials=tcfg.n_startup_trials,
+            n_warmup_steps=tcfg.n_warmup_steps,
+        ),
     )
 
 
