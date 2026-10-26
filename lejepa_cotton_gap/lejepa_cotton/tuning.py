@@ -9,6 +9,8 @@ split only (mAP50-95); the *test* split is read only by
 from __future__ import annotations
 
 import json
+import random
+import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -51,6 +53,9 @@ class TuningConfig:
         Epochs of each final retraining.
     seeds : tuple of int, default=(0, 1, 2)
         Retraining seeds.
+    regime_fractions : tuple of float, default=(0.1, 0.25, 0.5, 1.0)
+        Fractions of the training split used by :func:`retrain_by_regime`
+        (smallest to largest); validation and test sets stay fixed.
     sampler_seed : int, default=42
         Seed of the TPE sampler (same for both arms).
     n_startup_trials, n_warmup_steps : int
@@ -61,6 +66,7 @@ class TuningConfig:
     proxy_epochs: int = 30
     final_epochs: int = 120
     seeds: Tuple[int, ...] = (0, 1, 2)
+    regime_fractions: Tuple[float, ...] = (0.1, 0.25, 0.5, 1.0)
     sampler_seed: int = 42
     prune_percentile: float = 33
     n_startup_trials: int = 4
@@ -215,6 +221,105 @@ def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
     runs.to_csv(folder / "final_runs.csv", index=False)
     summary_table(runs).to_csv(folder / "final_summary.csv")
     return runs
+
+
+def regime_dataset(split_dir: Path, fraction: float, out_dir: Path, seed: int) -> Tuple[Path, int]:
+    """Build a dataset whose train split is a nested random subset of ``split_dir``'s train split.
+
+    Val and test images are shared with the full split (symlinked folders), so every
+    regime is scored on identical images. Subsets are nested: smaller regimes are
+    prefixes of one seeded shuffle.
+    """
+    train_images = sorted((split_dir / "images" / "train").iterdir())
+    random.Random(seed).shuffle(train_images)
+    n = max(1, round(len(train_images) * fraction))
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    for sub in ("images", "labels"):
+        (out_dir / sub / "train").mkdir(parents=True)
+        for extra in ("val", "test"):
+            if (split_dir / sub / extra).exists():
+                (out_dir / sub / extra).symlink_to((split_dir / sub / extra).resolve())
+    for image in train_images[:n]:
+        shutil.copy2(image, out_dir / "images" / "train" / image.name)
+        label = split_dir / "labels" / "train" / f"{image.stem}.txt"
+        if label.exists():
+            shutil.copy2(label, out_dir / "labels" / "train" / label.name)
+    yaml_text = (split_dir / "dataset.yaml").read_text().replace(
+        str(split_dir.resolve()), str(out_dir.resolve()), 1)
+    yaml_path = out_dir / "dataset.yaml"
+    yaml_path.write_text(yaml_text)
+    return yaml_path, n
+
+
+def retrain_by_regime(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
+                      studies: Optional[Dict[str, optuna.Study]] = None) -> pd.DataFrame:
+    """Retrain the tuned LeJEPA-init and COCO-init arms at several training-set sizes.
+
+    Uses each arm's best tuned parameters, every seed in ``tcfg.seeds`` and the
+    fractions in ``tcfg.regime_fractions`` (smallest to largest). Metrics are on the
+    fixed test split. Results are saved to ``<output_dir>/optuna/regime_runs.csv``,
+    ``regime_summary.csv`` and ``regime_comparison.csv``; finished runs are reused.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per regime, arm and seed.
+    """
+    device = ultralytics_device(select_device(cfg.device))
+    base_yaml = cfg.split_dir / "dataset.yaml"
+    if not base_yaml.exists():
+        raise FileNotFoundError(f"{base_yaml} not found; run run_tuning first.")
+    studies = studies or {arm: load_study(cfg, arm, tcfg) for arm in TUNING_ARMS}
+    coco_state = coco_state_dict(cfg.weights)
+    folder = cfg.output_dir / "optuna"
+    rows = []
+    for fraction in sorted(tcfg.regime_fractions):
+        tag = f"frac{int(round(fraction * 100)):03d}"
+        data_yaml, n_train = regime_dataset(cfg.split_dir, fraction, cfg.output_dir / "regimes" / tag,
+                                            cfg.seed)
+        for arm, study in studies.items():
+            init = _init_weights(cfg, arm)
+            for seed in tcfg.seeds:
+                cache = folder / f"regime_{tag}_{arm}_seed{seed}.json"
+                if cache.exists():
+                    rows.append(json.loads(cache.read_text()))
+                    continue
+                run_cfg = apply_params(cfg, study.best_params, tcfg.final_epochs, seed)
+                name = f"regime_{tag}_{arm}_seed{seed}"
+                run_dir, _ = finetune_detector(init, data_yaml, run_cfg, name, device, coco_state,
+                                               TUNING_ARMS[arm])
+                test = validate_detector(run_dir / "weights" / "best.pt", data_yaml, run_cfg, name, device,
+                                         split="test")
+                row = {"regime": tag, "fraction": fraction, "n_train": n_train, "arm": arm, "seed": seed,
+                       "mAP50": test["mAP50"], "mAP50-95": test["mAP50-95"]}
+                cache.write_text(json.dumps(row))
+                rows.append(row)
+    runs = pd.DataFrame(rows)
+    runs.to_csv(folder / "regime_runs.csv", index=False)
+    regime_summary(runs).to_csv(folder / "regime_summary.csv")
+    regime_comparison(runs).to_csv(folder / "regime_comparison.csv")
+    return runs
+
+
+def regime_summary(runs: pd.DataFrame) -> pd.DataFrame:
+    """Mean ± std of test mAP per regime and arm."""
+    grouped = runs.groupby(["n_train", "arm"])[["mAP50", "mAP50-95"]]
+    mean, std = grouped.mean(), grouped.std(ddof=1).fillna(0.0)
+    return pd.DataFrame({m: [f"{a:.4f} ± {b:.4f}" for a, b in zip(mean[m], std[m])] for m in mean.columns},
+                        index=mean.index)
+
+
+def regime_comparison(runs: pd.DataFrame) -> pd.DataFrame:
+    """Side-by-side LeJEPA-init vs COCO-init test mAP per regime, with the LeJEPA gain."""
+    mean = runs.groupby(["n_train", "arm"])[["mAP50", "mAP50-95"]].mean().unstack("arm")
+    table = pd.DataFrame(index=mean.index)
+    for metric in ("mAP50", "mAP50-95"):
+        table[f"{metric} LeJEPA"] = mean[(metric, "lejepa_init")]
+        table[f"{metric} COCO"] = mean[(metric, "coco_init")]
+        table[f"{metric} gain"] = table[f"{metric} LeJEPA"] - table[f"{metric} COCO"]
+        table[f"{metric} gain %"] = 100 * table[f"{metric} gain"] / table[f"{metric} COCO"]
+    return table.sort_index().round(4)
 
 
 def summary_table(runs: pd.DataFrame) -> pd.DataFrame:
