@@ -63,6 +63,7 @@ from .predict_video import predict_video
 from .tuning import (
     TuningConfig,
     plot_optimization_history,
+    plot_regime_bars,
     print_best_params,
     regime_comparison,
     regime_summary,
@@ -99,6 +100,7 @@ __all__ = [
     "TuningConfig",
     "plot_optimization_history",
     "print_best_params",
+    "plot_regime_bars",
     "regime_comparison",
     "regime_summary",
     "retrain_best",

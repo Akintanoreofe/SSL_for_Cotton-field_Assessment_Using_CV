@@ -322,6 +322,31 @@ def regime_comparison(runs: pd.DataFrame) -> pd.DataFrame:
     return table.sort_index().round(4)
 
 
+def plot_regime_bars(runs: pd.DataFrame, out_path: Optional[Path] = None):
+    """Grouped bars of test mAP (mean ± std over seeds) by training-set size, LeJEPA vs COCO."""
+    metrics = ("mAP50", "mAP50-95")
+    sizes = sorted(runs["n_train"].unique())
+    fig, axes = plt.subplots(1, len(metrics), figsize=(5 * len(metrics) + 1, 4.5), sharey=True)
+    width = 0.8 / len(TUNING_ARMS)
+    for ax, metric in zip(axes, metrics):
+        for i, (arm, variant) in enumerate(TUNING_ARMS.items()):
+            sub = runs[runs["arm"] == arm].groupby("n_train")[metric]
+            mean = sub.mean().reindex(sizes)
+            std = sub.std(ddof=1).reindex(sizes).fillna(0.0)
+            x = np.arange(len(sizes)) + (i - (len(TUNING_ARMS) - 1) / 2) * width
+            ax.bar(x, mean, width, yerr=std, capsize=3, label=display_variant_name(variant))
+        ax.set_xticks(np.arange(len(sizes)))
+        ax.set_xticklabels([str(n) for n in sizes])
+        ax.set(xlabel="Training images", ylabel=f"Test {metric}", title=metric)
+        ax.grid(True, axis="y", alpha=0.4)
+    axes[0].legend(fontsize=8)
+    fig.suptitle("LeJEPA vs COCO initialisation by data regime")
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    return fig
+
+
 def summary_table(runs: pd.DataFrame) -> pd.DataFrame:
     """Mean ± std (sample std over seeds) of test mAP per arm."""
     grouped = runs.groupby("arm")[["mAP50", "mAP50-95"]]
