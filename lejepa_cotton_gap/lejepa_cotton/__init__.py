@@ -61,6 +61,7 @@ from .pipeline import (
 )
 from .predict_video import predict_video
 from .tuning import (
+    RECOMMENDED_PARAMS,
     TuningConfig,
     plot_optimization_history,
     plot_regime_bars,
@@ -97,6 +98,7 @@ __all__ = [
     "intra_image_prediction_loss",
     "global_average_pool",
     "lejepa_loss",
+    "RECOMMENDED_PARAMS",
     "TuningConfig",
     "plot_optimization_history",
     "print_best_params",
