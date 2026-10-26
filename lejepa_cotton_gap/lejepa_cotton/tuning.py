@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import random
 import shutil
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -35,6 +35,14 @@ from .core_pretraining import select_device
 # arm name -> detection variant (neck and head are random in both arms)
 TUNING_ARMS: Dict[str, str] = {"lejepa_init": "lejepa", "coco_init": "coco_backbone"}
 VAL_METRIC_KEY = "metrics/mAP50-95(B)"
+
+# Recommended configuration for small labelled sets (~200 images) with a pretrained backbone
+# and random neck/head: AdamW with a moderate rate, a short backbone freeze so the random
+# head settles first, a damped backbone rate, and full mosaic with light mixup.
+RECOMMENDED_PARAMS: Dict[str, object] = {
+    "lr0": 1e-3, "lrf": 0.05, "weight_decay": 5e-4, "optimizer": "AdamW", "warmup_epochs": 3,
+    "freeze_backbone_epochs": 5, "backbone_lr_mult": 0.5, "mosaic": 1.0, "close_mosaic": 10, "mixup": 0.1,
+}
 
 
 @dataclass
@@ -60,6 +68,11 @@ class TuningConfig:
         Seed of the TPE sampler (same for both arms).
     n_startup_trials, n_warmup_steps : int
         Percentile-pruner settings.
+    skip_tuning : bool, default=False
+        Bypass the Optuna search: :func:`run_tuning` only prepares the split and the
+        retraining functions use ``fixed_params`` for both arms.
+    fixed_params : dict, default=RECOMMENDED_PARAMS
+        Parameters used when ``skip_tuning`` is True (same keys as :func:`suggest_params`).
     """
 
     n_trials: int = 40
@@ -71,6 +84,8 @@ class TuningConfig:
     prune_percentile: float = 33
     n_startup_trials: int = 4
     n_warmup_steps: int = 5
+    skip_tuning: bool = False
+    fixed_params: Dict[str, object] = field(default_factory=lambda: dict(RECOMMENDED_PARAMS))
 
 
 def suggest_params(trial: optuna.Trial) -> Dict[str, object]:
@@ -178,8 +193,19 @@ def run_tuning(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig()) ->
     device = ultralytics_device(select_device(cfg.device))
     data_yaml = prepare_detection_split(cfg.source_dir, cfg.split_dir, cfg.class_names, cfg.val_ratio,
                                         cfg.max_train_images, cfg.seed, cfg.split_by, cfg.test_ratio)
+    if tcfg.skip_tuning:
+        print("skip_tuning=True: using fixed hyper-parameters, no Optuna search.")
+        return {}
     coco_state = coco_state_dict(cfg.weights)
     return {arm: tune_arm(cfg, data_yaml, arm, tcfg, device, coco_state) for arm in TUNING_ARMS}
+
+
+def _arm_params(arm: str, tcfg: TuningConfig, cfg: DetectionEvalConfig,
+                studies: Optional[Dict[str, optuna.Study]]) -> Dict[str, object]:
+    """Parameters for an arm: the fixed set when tuning is skipped, else the study's best."""
+    if tcfg.skip_tuning:
+        return tcfg.fixed_params
+    return (studies[arm] if studies else load_study(cfg, arm, tcfg)).best_params
 
 
 def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
@@ -197,18 +223,18 @@ def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
     data_yaml = cfg.split_dir / "dataset.yaml"
     if not data_yaml.exists():
         raise FileNotFoundError(f"{data_yaml} not found; run run_tuning first.")
-    studies = studies or {arm: load_study(cfg, arm, tcfg) for arm in TUNING_ARMS}
     coco_state = coco_state_dict(cfg.weights)
     folder = cfg.output_dir / "optuna"
+    folder.mkdir(parents=True, exist_ok=True)
     rows = []
-    for arm, study in studies.items():
+    for arm in TUNING_ARMS:
         init = _init_weights(cfg, arm)
         for seed in tcfg.seeds:
             cache = folder / f"final_{arm}_seed{seed}.json"
             if cache.exists():
                 rows.append(json.loads(cache.read_text()))
                 continue
-            run_cfg = apply_params(cfg, study.best_params, tcfg.final_epochs, seed)
+            run_cfg = apply_params(cfg, _arm_params(arm, tcfg, cfg, studies), tcfg.final_epochs, seed)
             name = f"final_{arm}_seed{seed}"
             run_dir, _ = finetune_detector(init, data_yaml, run_cfg, name, device, coco_state,
                                            TUNING_ARMS[arm])
@@ -270,7 +296,6 @@ def retrain_by_regime(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfi
     base_yaml = cfg.split_dir / "dataset.yaml"
     if not base_yaml.exists():
         raise FileNotFoundError(f"{base_yaml} not found; run run_tuning first.")
-    studies = studies or {arm: load_study(cfg, arm, tcfg) for arm in TUNING_ARMS}
     coco_state = coco_state_dict(cfg.weights)
     folder = cfg.output_dir / "optuna"
     rows = []
@@ -278,14 +303,14 @@ def retrain_by_regime(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfi
         tag = f"frac{int(round(fraction * 100)):03d}"
         data_yaml, n_train = regime_dataset(cfg.split_dir, fraction, cfg.output_dir / "regimes" / tag,
                                             cfg.seed)
-        for arm, study in studies.items():
+        for arm in TUNING_ARMS:
             init = _init_weights(cfg, arm)
             for seed in tcfg.seeds:
                 cache = folder / f"regime_{tag}_{arm}_seed{seed}.json"
                 if cache.exists():
                     rows.append(json.loads(cache.read_text()))
                     continue
-                run_cfg = apply_params(cfg, study.best_params, tcfg.final_epochs, seed)
+                run_cfg = apply_params(cfg, _arm_params(arm, tcfg, cfg, studies), tcfg.final_epochs, seed)
                 name = f"regime_{tag}_{arm}_seed{seed}"
                 run_dir, _ = finetune_detector(init, data_yaml, run_cfg, name, device, coco_state,
                                                TUNING_ARMS[arm])
@@ -357,8 +382,13 @@ def summary_table(runs: pd.DataFrame) -> pd.DataFrame:
     return table
 
 
-def print_best_params(studies: Dict[str, optuna.Study]) -> None:
-    """Print best value and parameters of every arm."""
+def print_best_params(studies: Dict[str, optuna.Study], tcfg: Optional[TuningConfig] = None) -> None:
+    """Print best value and parameters of every arm (or the fixed set when tuning is skipped)."""
+    if not studies:
+        print("No studies (tuning skipped); fixed parameters:")
+        for key, value in (tcfg or TuningConfig()).fixed_params.items():
+            print(f"    {key}: {value}")
+        return
     for arm, study in studies.items():
         print(f"[{arm}] best val mAP50-95 = {study.best_value:.4f} (trial {study.best_trial.number})")
         for key, value in study.best_params.items():
@@ -367,6 +397,9 @@ def print_best_params(studies: Dict[str, optuna.Study]) -> None:
 
 def plot_optimization_history(studies: Dict[str, optuna.Study], out_path: Optional[Path] = None):
     """Plot trial values and running best per arm."""
+    if not studies:
+        print("No studies to plot (tuning skipped).")
+        return None
     fig, ax = plt.subplots(figsize=(8, 4.5))
     for arm, study in studies.items():
         trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
