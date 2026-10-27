@@ -367,7 +367,7 @@ def test_local_path_samples_tokens_and_logs_local_sigreg():
 
 def test_tuning_search_space_and_params():
     import optuna
-    from lejepa_cotton.tuning import apply_params, suggest_params
+    from lejepa_cotton.tuning import RECOMMENDED_PARAMS, apply_params, suggest_params
     trial = optuna.create_study().ask()
     params = suggest_params(trial)
     assert set(params) == {"lr0", "lrf", "weight_decay", "optimizer", "warmup_epochs",
@@ -377,6 +377,9 @@ def test_tuning_search_space_and_params():
     out = apply_params(cfg, params, 30, seed=3)
     assert out.epochs == 30 and out.seed == 3
     assert out.train_overrides["mosaic"] == params["mosaic"]
+    assert out.warmup_epochs == params["warmup_epochs"] and out.cos_lr
+    assert out.patience == 50 and out.close_mosaic == 15 and not out.plots
+    assert RECOMMENDED_PARAMS["lr0"] == 0.002
 
 
 def test_coco_state_dict_explains_local_weights_fallback(monkeypatch):

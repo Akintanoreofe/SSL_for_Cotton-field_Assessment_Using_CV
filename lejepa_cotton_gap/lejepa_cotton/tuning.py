@@ -40,8 +40,8 @@ VAL_METRIC_KEY = "metrics/mAP50-95(B)"
 # and random neck/head: AdamW with a moderate rate, a short backbone freeze so the random
 # head settles first, a damped backbone rate, and full mosaic with light mixup.
 RECOMMENDED_PARAMS: Dict[str, object] = {
-    "lr0": 1e-3, "lrf": 0.05, "weight_decay": 5e-4, "optimizer": "AdamW", "warmup_epochs": 3,
-    "freeze_backbone_epochs": 5, "backbone_lr_mult": 0.5, "mosaic": 1.0, "close_mosaic": 10, "mixup": 0.1,
+    "lr0": 2e-3, "lrf": 0.05, "weight_decay": 5e-4, "optimizer": "AdamW", "warmup_epochs": 5,
+    "freeze_backbone_epochs": 5, "backbone_lr_mult": 0.5, "mosaic": 1.0, "close_mosaic": 15, "mixup": 0.1,
 }
 
 
@@ -107,10 +107,10 @@ def suggest_params(trial: optuna.Trial) -> Dict[str, object]:
 def apply_params(cfg: DetectionEvalConfig, params: Dict[str, object], epochs: int,
                  seed: Optional[int] = None) -> DetectionEvalConfig:
     """Copy a detection config with tuned parameters applied."""
-    overrides = {**cfg.train_overrides, "warmup_epochs": params["warmup_epochs"],
-                 "mosaic": params["mosaic"], "mixup": params["mixup"]}
+    overrides = {**cfg.train_overrides, "mosaic": params["mosaic"], "mixup": params["mixup"]}
     return replace(
         cfg, epochs=epochs, seed=cfg.seed if seed is None else seed, lr0=params["lr0"], lrf=params["lrf"],
+        warmup_epochs=int(params["warmup_epochs"]),
         weight_decay=params["weight_decay"], optimizer=params["optimizer"],
         freeze_backbone_epochs=min(int(params["freeze_backbone_epochs"]), epochs),
         backbone_lr_mult=params["backbone_lr_mult"], close_mosaic=int(params["close_mosaic"]),

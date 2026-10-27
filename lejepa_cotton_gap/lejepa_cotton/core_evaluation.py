@@ -579,6 +579,10 @@ class DetectionEvalConfig:
         Ultralytics optimiser name.
     lr0 : float, default=0.002
         Initial learning rate.
+    warmup_epochs : int, default=5
+        Learning-rate warmup epochs.
+    cos_lr : bool, default=True
+        Use cosine learning-rate decay.
     lrf : float, default=0.01
         Final learning-rate fraction.
     weight_decay : float, default=1e-4
@@ -589,10 +593,12 @@ class DetectionEvalConfig:
         Freeze the backbone for this many initial epochs, then unfreeze it.
     backbone_lr_mult : float, default=1.0
         Multiplier applied to the backbone learning rate.
-    close_mosaic : int, default=10
+    close_mosaic : int, default=15
         Epochs at the end without mosaic augmentation.
-    patience : int, default=20
+    patience : int, default=50
         Early-stopping patience.
+    plots : bool, default=False
+        Save Ultralytics training plots.
     workers : int, default=0
         Data-loading workers.
     amp : bool, default=False
@@ -622,12 +628,15 @@ class DetectionEvalConfig:
     optimizer: str = "AdamW"
     lr0: float = 0.002
     lrf: float = 0.01
+    warmup_epochs: int = 5
+    cos_lr: bool = True
     weight_decay: float = 1e-4
     freeze: Optional[int] = None
     freeze_backbone_epochs: int = 0
     backbone_lr_mult: float = 1.0
-    close_mosaic: int = 10
-    patience: int = 20
+    close_mosaic: int = 15
+    patience: int = 50
+    plots: bool = False
     workers: int = 0
     amp: bool = False
     conf: float = 0.25
@@ -977,13 +986,14 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
     if coco_state is not None:
         model.add_callback("on_train_start", partial(record_initialisation, variant=audit_variant or run_name,
                                                      coco_state=coco_state, report=init_report))
+    train_options = {"warmup_epochs": cfg.warmup_epochs, "cos_lr": cfg.cos_lr, **cfg.train_overrides}
     model.train(
         data=str(data_yaml), epochs=cfg.epochs, imgsz=cfg.image_size, batch=cfg.batch_size,
         device=device, optimizer=cfg.optimizer, lr0=cfg.lr0, lrf=cfg.lrf,
         weight_decay=cfg.weight_decay, freeze=cfg.freeze, close_mosaic=cfg.close_mosaic,
         patience=cfg.patience, workers=cfg.workers, amp=cfg.amp, seed=cfg.seed,
-        project=str(cfg.runs_dir), name=run_name, exist_ok=True, plots=True, val=True,
-        **cfg.train_overrides,
+        project=str(cfg.runs_dir), name=run_name, exist_ok=True, plots=cfg.plots, val=True,
+        **train_options,
     )
     return Path(model.trainer.save_dir), init_report
 
