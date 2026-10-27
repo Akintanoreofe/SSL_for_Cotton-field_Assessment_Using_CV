@@ -133,7 +133,7 @@ modern = PretrainConfig(
 )
 ```
 
-Set `transfer="backbone+neck"` to export the pretrained PAN-FPN layers as well. `DetectionEvalConfig` provides `freeze_backbone_epochs` (default 0) and `backbone_lr_mult` (default 1.0); these settings are applied to every compared initialization. Detection metrics include AP50, AP50-95 and AP75.
+Set `transfer="backbone+neck"` to export the pretrained PAN-FPN layers as well. `DetectionEvalConfig` provides `freeze_backbone_epochs` (default 0) and `backbone_lr_mult` (default 1.0); these settings are applied to every compared initialization. Fine-tuning defaults use five warmup epochs, cosine LR decay, 50-epoch early-stopping patience, and disable training plots. The notebook uses `image_size=512` for both pretraining and detection (batch size 8 for detection); if you change the image size, pretrain a checkpoint at that same size. Detection metrics include AP50, AP50-95 and AP75.
 
 For video inference from a fine-tuned detector:
 
