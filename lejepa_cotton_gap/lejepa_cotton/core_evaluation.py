@@ -609,6 +609,11 @@ class DetectionEvalConfig:
         Seed for splitting and training.
     device : str or None, default=None
         Torch device string; ``None`` selects automatically.
+    val_conf : float, default=0.01
+        Confidence threshold for the per-epoch validation during training. The
+        Ultralytics default (0.001) floods NMS with candidates, which is very
+        slow on MPS and trips the NMS time limit (dropping detections).
+        Final :func:`validate_detector` scoring keeps the default.
     train_overrides : dict, default={}
         Extra keyword arguments forwarded to ``YOLO.train``.
     """
@@ -642,6 +647,7 @@ class DetectionEvalConfig:
     conf: float = 0.25
     seed: int = 42
     device: Optional[str] = None
+    val_conf: float = 0.01
     train_overrides: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -986,7 +992,8 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
     if coco_state is not None:
         model.add_callback("on_train_start", partial(record_initialisation, variant=audit_variant or run_name,
                                                      coco_state=coco_state, report=init_report))
-    train_options = {"warmup_epochs": cfg.warmup_epochs, "cos_lr": cfg.cos_lr, **cfg.train_overrides}
+    train_options = {"warmup_epochs": cfg.warmup_epochs, "cos_lr": cfg.cos_lr, "conf": cfg.val_conf,
+                     **cfg.train_overrides}
     model.train(
         data=str(data_yaml), epochs=cfg.epochs, imgsz=cfg.image_size, batch=cfg.batch_size,
         device=device, optimizer=cfg.optimizer, lr0=cfg.lr0, lrf=cfg.lrf,
