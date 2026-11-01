@@ -10,6 +10,8 @@ so runs can resume.
 from __future__ import annotations
 
 import json
+import math
+import time
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -31,11 +33,24 @@ from .core_evaluation import (
     validate_detector,
 )
 from .core_pretraining import select_device
+from .nms_tuning import max_boxes_per_image, tuning_nms
 
 # arm name -> detection variant (neck and head are random in both arms)
 TUNING_ARMS: Dict[str, str] = {"lejepa_init": "lejepa", "coco_init": "coco_backbone"}
 TUNED_ARMS: Tuple[str, ...] = ("lejepa_init",)  # only the LeJEPA backbone is searched
 VAL_METRIC_KEY = "metrics/mAP50-95(B)"
+
+# --- Tuning-time validation settings (identical in every trial; NOT the paper's final-eval settings) ---
+# conf=0.001 / conf=0.01 flood NMS with low-score boxes (very slow on MPS, trips the NMS time limit and
+# silently drops detections). A higher threshold is used only to rank trials.
+TUNING_VAL_CONF = 0.05
+TUNING_MAX_DET = 300           # raised per dataset if any val image has more than ~250 GT boxes
+TUNING_MAX_NMS = 3000          # candidates per image fed to NMS (Ultralytics default 30000); only settable by patch
+# Time limit per NMS call is 2 + max_time_img * batch seconds; make it huge so it never truncates tuning results.
+TUNING_NMS_MAX_TIME_IMG = 60.0
+TUNING_NMS_ON_CPU = False      # set True if benchmark_val_pass shows CPU NMS is faster on MPS
+# --- Final (paper) evaluation: standard COCO-style settings ---
+FINAL_EVAL_CONF = 0.001
 
 # Recommended configuration for small labelled sets (~200 images) with a pretrained backbone
 # and random neck/head: AdamW with a moderate rate, a short backbone freeze so the random
@@ -86,7 +101,8 @@ class TuningConfig:
 
 
 # Bump when the search space changes: Optuna cannot resume a study whose categorical choices differ.
-SEARCH_SPACE_VERSION = "v2"
+# v3: search space unchanged, but eval settings changed (conf/max_det/NMS), so v2 trials are not comparable.
+SEARCH_SPACE_VERSION = "v3"
 
 
 def suggest_params(trial: optuna.Trial) -> Dict[str, object]:
@@ -120,10 +136,34 @@ def apply_params(cfg: DetectionEvalConfig, params: Dict[str, object], epochs: in
 
 
 def study_storage(cfg: DetectionEvalConfig) -> str:
-    """SQLite URL holding both studies."""
+    """SQLite URL holding the durable, resumable Optuna studies."""
     folder = cfg.output_dir / "optuna"
     folder.mkdir(parents=True, exist_ok=True)
     return f"sqlite:///{(folder / 'studies.db').resolve()}"
+
+
+def save_study_progress(cfg: DetectionEvalConfig, study: optuna.Study) -> Path:
+    """Atomically export trial progress for inspection; SQLite remains the resume source."""
+    path = cfg.output_dir / "optuna" / f"{study.study_name}_progress.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "study_name": study.study_name,
+        "trials": [
+            {
+                "number": trial.number,
+                "state": trial.state.name,
+                "value": trial.value,
+                "params": trial.params,
+                "user_attrs": trial.user_attrs,
+                "intermediate_values": trial.intermediate_values,
+            }
+            for trial in study.get_trials(deepcopy=False)
+        ],
+    }
+    temporary_path = path.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(record, indent=2, allow_nan=True))
+    temporary_path.replace(path)
+    return path
 
 
 def load_study(cfg: DetectionEvalConfig, arm: str, tcfg: TuningConfig) -> optuna.Study:
@@ -143,20 +183,37 @@ def _init_weights(cfg: DetectionEvalConfig, arm: str) -> str:
     return detection_init_weights(TUNING_ARMS[arm], cfg.weights, cfg.init_dir, f"tune_{arm}")
 
 
+def tuning_max_det(cfg: DetectionEvalConfig) -> int:
+    """``TUNING_MAX_DET``, raised (with 20% headroom) when a val image has >250 GT boxes so recall is not capped."""
+    worst = max_boxes_per_image(cfg.split_dir / "labels" / "val")
+    if worst <= 250:
+        return TUNING_MAX_DET
+    return max(TUNING_MAX_DET, int(math.ceil(worst * 1.2 / 50) * 50))
+
+
 def tune_arm(cfg: DetectionEvalConfig, data_yaml: Path, arm: str, tcfg: TuningConfig,
              device: str, coco_state=None) -> optuna.Study:
     """Run (or resume) the proxy search of one arm; objective is val mAP50-95."""
     study = load_study(cfg, arm, tcfg)
+    progress_path = save_study_progress(cfg, study)
+    print(f"Resuming {study.study_name}; durable study: {study_storage(cfg)}, "
+          f"progress snapshot: {progress_path}", flush=True)
     done = [t for t in study.trials if t.state.is_finished()]
     remaining = tcfg.n_trials - len(done)
     if remaining <= 0:
         return study
     init = _init_weights(cfg, arm)
+    max_det = tuning_max_det(cfg)
 
     def objective(trial: optuna.Trial) -> float:
         trial_cfg = apply_params(cfg, suggest_params(trial), tcfg.proxy_epochs)
+        # Same low-candidate validation settings for per-epoch val and the final val of best.pt.
+        trial_cfg = replace(trial_cfg, val_conf=TUNING_VAL_CONF,
+                            train_overrides={**trial_cfg.train_overrides, "max_det": max_det})
 
         def report(epoch: int, metrics: Dict[str, float]) -> None:
+            if epoch >= trial_cfg.epochs:  # the trainer's final val of best.pt fires one step past the last epoch
+                return
             value = metrics.get(VAL_METRIC_KEY)
             if value is None or not np.isfinite(value):
                 return
@@ -165,9 +222,22 @@ def tune_arm(cfg: DetectionEvalConfig, data_yaml: Path, arm: str, tcfg: TuningCo
                 raise optuna.TrialPruned()
 
         name = f"tune_{arm}_trial{trial.number:03d}"
+        print(f"\nStarting trial #{trial.number:03d} "
+              f"({trial.number + 1} of {tcfg.n_trials}): {name}", flush=True)
+        final: Dict[str, float] = {}
         try:
-            run_dir, _ = finetune_detector(init, data_yaml, trial_cfg, name, device, coco_state,
-                                           TUNING_ARMS[arm], epoch_callback=report)
+            # Scoped NMS patch: generous time limit + candidate cap; counts timeouts over all val passes of the trial.
+            with tuning_nms(TUNING_MAX_NMS, TUNING_NMS_MAX_TIME_IMG, TUNING_NMS_ON_CPU) as timeouts:
+                try:
+                    run_dir, _ = finetune_detector(init, data_yaml, trial_cfg, name, device, coco_state,
+                                                   TUNING_ARMS[arm], epoch_callback=report, final_metrics=final)
+                finally:
+                    trial.set_user_attr("nms_timeouts", timeouts.count)
+                    trial.set_user_attr("had_nms_timeout", timeouts.count > 0)
+                    trial.set_user_attr("val_conf", TUNING_VAL_CONF)
+                    trial.set_user_attr("val_max_det", max_det)
+                    if timeouts.count:
+                        print(f"WARNING: trial {trial.number} had {timeouts.count} NMS timeout(s); metrics truncated.")
         except RuntimeError as error:
             # Diverged (NaN) predictions or MPS masked-assignment bugs break the TAL assigner.
             if "shape mismatch" not in str(error):
@@ -175,11 +245,50 @@ def tune_arm(cfg: DetectionEvalConfig, data_yaml: Path, arm: str, tcfg: TuningCo
             print(f"Trial {trial.number} pruned: assigner shape mismatch ({error}). "
                   "If this repeats, set DetectionEvalConfig.device='cpu' or lower lr0.")
             raise optuna.TrialPruned() from error
-        return validate_detector(run_dir / "weights" / "best.pt", data_yaml, trial_cfg, name, device,
-                                 split="val")["mAP50-95"]
+        # The trainer already validated best.pt on the val split with the identical settings
+        # (conf, iou, max_det, imgsz, batch), so reuse it instead of running another val pass.
+        value = final.get(VAL_METRIC_KEY)
+        if value is None or not np.isfinite(value):
+            with tuning_nms(TUNING_MAX_NMS, TUNING_NMS_MAX_TIME_IMG, TUNING_NMS_ON_CPU):
+                value = validate_detector(run_dir / "weights" / "best.pt", data_yaml, trial_cfg, name, device,
+                                          split="val", conf=TUNING_VAL_CONF, max_det=max_det)["mAP50-95"]
+        return float(value)
 
-    study.optimize(objective, n_trials=remaining)
+    def save_progress(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        save_study_progress(cfg, study)
+
+    study.optimize(objective, n_trials=remaining, callbacks=[save_progress])
     return study
+
+
+def benchmark_val_pass(weights: Path, data_yaml: Path, cfg: DetectionEvalConfig, device: str,
+                       include_baseline: bool = False) -> pd.DataFrame:
+    """Time one val pass of ``weights`` under old/new settings and print a before/after table.
+
+    ``baseline`` (conf=0.001, stock NMS limits) can take over an hour on MPS, hence opt-in.
+    Also compares NMS on MPS vs one CPU transfer per batch. Speeds are Ultralytics per-image ms.
+    """
+    from ultralytics import YOLO
+
+    max_det = tuning_max_det(cfg)
+    runs = [("tuned conf=%.2f, NMS on device" % TUNING_VAL_CONF, TUNING_VAL_CONF, True, False),
+            ("tuned conf=%.2f, NMS on CPU" % TUNING_VAL_CONF, TUNING_VAL_CONF, True, True)]
+    if include_baseline:
+        runs.insert(0, ("baseline conf=0.001, stock limits", 0.001, False, False))
+    rows = []
+    for label, conf, patched, on_cpu in runs:
+        start = time.time()
+        with tuning_nms(TUNING_MAX_NMS, TUNING_NMS_MAX_TIME_IMG, on_cpu) if patched else tuning_nms(
+                30000, 0.05, False) as timeouts:
+            m = YOLO(str(weights)).val(data=str(data_yaml), imgsz=cfg.image_size, batch=cfg.batch_size,
+                                       device=device, split="val", plots=False, conf=conf, max_det=max_det,
+                                       project=str(cfg.runs_dir), name="benchmark_val", exist_ok=True)
+        rows.append({"setting": label, "postprocess_ms_img": m.speed["postprocess"],
+                     "inference_ms_img": m.speed["inference"], "wall_s": time.time() - start,
+                     "nms_timeouts": timeouts.count, "mAP50-95": float(m.box.map)})
+    table = pd.DataFrame(rows)
+    print(table.to_string(index=False))
+    return table
 
 
 def evaluation_split(cfg: DetectionEvalConfig) -> str:
@@ -284,7 +393,8 @@ def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
                                            TUNING_ARMS[arm])
             best = run_dir / "weights" / "best.pt"
             arm_rows = [{"arm": arm, "seed": seed, "split": label,
-                         **validate_detector(best, data_yaml, run_cfg, name, device, split=split)}
+                         **validate_detector(best, data_yaml, run_cfg, name, device, split=split,
+                                           conf=FINAL_EVAL_CONF)}
                         for label, split in (("eval", eval_split), ("train", "train"))]
             cache.write_text(json.dumps(arm_rows))
             rows.extend(arm_rows)
