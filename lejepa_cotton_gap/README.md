@@ -149,7 +149,7 @@ python -m lejepa_cotton.predict_video --weights outputs/detection/runs/lejepa/we
 ```python
 from lejepa_cotton import (PretrainConfig, DetectionEvalConfig, WeightSources, TuningConfig,
                            run_pretraining, run_tuning, retrain_best, print_best_params,
-                           plot_optimization_history, summary_table)
+                           plot_optimization_history, summary_table, run_final_report)
 
 pre = PretrainConfig(image_root="path/to/mars_multi_camera_boll", output_dir="outputs/pretraining")
 run_pretraining(pre)
@@ -158,14 +158,17 @@ det = DetectionEvalConfig(source_dir="path/to/image_dataset", output_dir="output
                           weights=WeightSources(lejepa_checkpoint=pre.checkpoint_path,
                                                 coco_weights="yolov8n.pt"),
                           val_ratio=0.2, test_ratio=0.2)
-tcfg = TuningConfig(n_trials=20)           # 30-epoch proxy trials, same budget for both arms
-studies = run_tuning(det, tcfg)            # TPE + median pruner, val mAP50-95; resumable (SQLite)
-print_best_params(studies); plot_optimization_history(studies)
-runs = retrain_best(det, tcfg, studies)    # best config per arm, 120 epochs x 3 seeds, test split
-print(summary_table(runs))                 # mean ± std of test mAP50 / mAP50-95
+tcfg = TuningConfig()                      # 100 pruned trials x 10 epochs, LeJEPA backbone only
+studies = run_tuning(det, tcfg)            # TPE + percentile pruner, val mAP50-95; resumable (SQLite)
+print_best_params(studies); plot_optimization_history(studies)   # best params also in optuna/best_params_lejepa.json
+runs = retrain_best(det, tcfg, studies)    # LeJEPA and COCO backbones, 30 epochs, best LeJEPA params
+print(summary_table(runs[runs["split"] == "eval"]))   # evaluation (test) split = primary benchmark
+run_final_report(det, runs, tcfg)          # overlap/occlusion comparison + train-vs-eval diagnostics
 ```
 
-Tuning compares the LeJEPA-init and COCO-backbone-init arms with an identical search space (lr0, lrf, weight_decay, optimizer, warmup_epochs, backbone freeze epochs, backbone LR multiplier, mosaic, close_mosaic, mixup). Studies are stored in `detection/optuna/studies.db`; the test split is only read by `retrain_best`. `run_detection_evaluation` still fine-tunes the variants with default settings and writes `eval/boxes_<variant>.csv`. The notebook `notebooks/run_gap_lejepa_pipeline.ipynb` runs this whole flow.
+Only the LeJEPA-init arm is tuned (search space: lr0, lrf, weight_decay, optimizer, warmup_epochs, backbone freeze epochs, backbone LR multiplier, mosaic, close_mosaic, mixup). Studies are stored in `detection/optuna/studies.db` and the best configuration in `detection/optuna/best_params_lejepa.json`; the test split is only read by `retrain_best`. The final 30-epoch training of both backbones uses that configuration, so the comparison differs only in the pretrained backbone. The evaluation (test) split is the primary benchmark; the training split is scored only for diagnostics (precision, recall, F1, mAP50, mAP50-95).
+
+`run_final_report` writes to `detection/analysis/`: `overlap_comparison.md` (metrics on evaluation images with overlapping or heavily occluded boxes, recall on occluded boxes, per-image wins, `overlap_examples.png` with predictions and per-image metrics, and a summary of where LeJEPA helps or not), `training_diagnostics.md` (train vs evaluation metrics, loss curves, annotation statistics and a rule-based underfitting/overfitting/data/annotation/optimisation reading) and the combined `final_report.md`. Overlap is defined by `OverlapConfig` (IoU >= 0.3 between boxes, or a box >= 50% covered). `run_detection_evaluation` still fine-tunes the variants with default settings and writes `eval/boxes_<variant>.csv`. The notebook `notebooks/run_gap_lejepa_pipeline.ipynb` runs this whole flow.
 
 ## Outputs
 
