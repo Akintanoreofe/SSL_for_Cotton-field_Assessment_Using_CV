@@ -937,7 +937,8 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
                       run_name: str, device: str,
                       coco_state: Optional[Dict[str, torch.Tensor]] = None,
                       audit_variant: Optional[str] = None,
-                      epoch_callback: Optional[Callable[[int, Dict[str, float]], None]] = None
+                      epoch_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
+                      final_metrics: Optional[Dict[str, float]] = None
                       ) -> Tuple[Path, Dict[str, float]]:
     """Fine-tune a YOLOv8 detector, auditing its starting weights.
 
@@ -968,6 +969,10 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
         Called as ``epoch_callback(epoch, metrics)`` after each epoch's
         validation (``metrics`` is the Ultralytics metrics dictionary); it may
         raise to stop training (used for pruning).
+
+    final_metrics : dict or None, default=None
+        Filled in place with the trainer's final validation of ``best.pt`` (Ultralytics
+        metric keys), so callers can reuse it instead of validating again.
 
     Returns
     -------
@@ -1002,11 +1007,14 @@ def finetune_detector(init_weights: str, data_yaml: Path, cfg: DetectionEvalConf
         project=str(cfg.runs_dir), name=run_name, exist_ok=True, plots=cfg.plots, val=True,
         **train_options,
     )
+    if final_metrics is not None:
+        final_metrics.update(model.trainer.metrics)
     return Path(model.trainer.save_dir), init_report
 
 
 def validate_detector(weights: Path, data_yaml: Path, cfg: DetectionEvalConfig,
-                      run_name: str, device: str, split: str = "val") -> Dict[str, float]:
+                      run_name: str, device: str, split: str = "val", conf: Optional[float] = None,
+                      max_det: Optional[int] = None) -> Dict[str, float]:
     """Compute detection metrics on the validation (or test) split.
 
     The default low confidence threshold of Ultralytics is kept so mAP is
@@ -1026,15 +1034,19 @@ def validate_detector(weights: Path, data_yaml: Path, cfg: DetectionEvalConfig,
         Ultralytics device string.
     split : {"train", "val", "test"}, default="val"
         Split to score.
+    conf, max_det : float or int or None, default=None
+        ``None`` keeps the Ultralytics defaults (conf=0.001, max_det=300), i.e. standard final eval.
 
     Returns
     -------
     dict of str to float
         ``precision``, ``recall``, ``f1``, ``mAP50``, ``mAP50-95`` and ``mAP75``.
     """
+    extra = {k: v for k, v in (("conf", conf), ("max_det", max_det)) if v is not None}
     metrics = YOLO(str(weights)).val(
         data=str(data_yaml), imgsz=cfg.image_size, batch=cfg.batch_size, device=device,
         split=split, plots=False, project=str(cfg.runs_dir), name=f"{run_name}_{split}", exist_ok=True,
+        **extra,
     )
     box = metrics.box
     precision, recall = float(box.mp), float(box.mr)
