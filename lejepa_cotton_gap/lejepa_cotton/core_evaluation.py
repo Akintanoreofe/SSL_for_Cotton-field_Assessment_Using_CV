@@ -1024,20 +1024,22 @@ def validate_detector(weights: Path, data_yaml: Path, cfg: DetectionEvalConfig,
         Name of the validation output folder.
     device : str
         Ultralytics device string.
-    split : {"val", "test"}, default="val"
+    split : {"train", "val", "test"}, default="val"
         Split to score.
 
     Returns
     -------
     dict of str to float
-        ``precision``, ``recall``, ``mAP50`` and ``mAP50-95``.
+        ``precision``, ``recall``, ``f1``, ``mAP50``, ``mAP50-95`` and ``mAP75``.
     """
     metrics = YOLO(str(weights)).val(
         data=str(data_yaml), imgsz=cfg.image_size, batch=cfg.batch_size, device=device,
         split=split, plots=False, project=str(cfg.runs_dir), name=f"{run_name}_{split}", exist_ok=True,
     )
     box = metrics.box
-    return {"precision": float(box.mp), "recall": float(box.mr),
+    precision, recall = float(box.mp), float(box.mr)
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
+    return {"precision": precision, "recall": recall, "f1": f1,
             "mAP50": float(box.map50), "mAP50-95": float(box.map),
             "mAP75": float(box.all_ap[:, 5].mean()) if getattr(box, "all_ap", None) is not None else float("nan")}
 

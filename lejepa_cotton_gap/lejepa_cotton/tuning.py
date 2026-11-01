@@ -1,16 +1,16 @@
-"""Optuna hyper-parameter tuning and multi-seed retraining of detection arms.
+"""Optuna hyper-parameter tuning of the LeJEPA arm and final training of both arms.
 
-Two arms (LeJEPA-init and COCO-init) share one search space, one trial budget
-and one sampler seed. Trials are 30-epoch proxies scored on the *validation*
-split only (mAP50-95); the *test* split is read only by
-:func:`retrain_best`. Studies live in an SQLite file so runs can resume.
+Only the LeJEPA-init arm is tuned (pruned Optuna study, 100 trials of 10 epochs,
+scored on the *validation* split by mAP50-95). The best configuration is saved
+and logged, then reused unchanged to train the LeJEPA-init and the COCO-init
+backbones for 30 epochs with the same pipeline. Studies live in an SQLite file
+so runs can resume.
 """
 
 from __future__ import annotations
 
 import json
-import random
-import shutil
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -34,6 +34,7 @@ from .core_pretraining import select_device
 
 # arm name -> detection variant (neck and head are random in both arms)
 TUNING_ARMS: Dict[str, str] = {"lejepa_init": "lejepa", "coco_init": "coco_backbone"}
+TUNED_ARMS: Tuple[str, ...] = ("lejepa_init",)  # only the LeJEPA backbone is searched
 VAL_METRIC_KEY = "metrics/mAP50-95(B)"
 
 # Recommended configuration for small labelled sets (~200 images) with a pretrained backbone
@@ -51,19 +52,16 @@ class TuningConfig:
 
     Parameters
     ----------
-    n_trials : int, default=40
-        Finished trials (complete, pruned or failed) per arm; identical for both.
+    n_trials : int, default=100
+        Finished trials (complete, pruned or failed) of the LeJEPA study.
     prune_percentile : float, default=33
         Percentile threshold used by the pruning algorithm.
-    proxy_epochs : int, default=30
+    proxy_epochs : int, default=10
         Epochs per tuning trial.
-    final_epochs : int, default=120
-        Epochs of each final retraining.
-    seeds : tuple of int, default=(0, 1, 2)
-        Retraining seeds.
-    regime_fractions : tuple of float, default=(0.1, 0.25, 0.5, 1.0)
-        Fractions of the training split used by :func:`retrain_by_regime`
-        (smallest to largest); validation and test sets stay fixed.
+    final_epochs : int, default=30
+        Epochs of the final training of both arms.
+    seeds : tuple of int, default=(0,)
+        Final-training seeds.
     sampler_seed : int, default=42
         Seed of the TPE sampler (same for both arms).
     n_startup_trials, n_warmup_steps : int
@@ -75,11 +73,10 @@ class TuningConfig:
         Parameters used when ``skip_tuning`` is True (same keys as :func:`suggest_params`).
     """
 
-    n_trials: int = 40
-    proxy_epochs: int = 30
-    final_epochs: int = 120
-    seeds: Tuple[int, ...] = (0, 1, 2)
-    regime_fractions: Tuple[float, ...] = (0.1, 0.25, 0.5, 1.0)
+    n_trials: int = 100
+    proxy_epochs: int = 10
+    final_epochs: int = 30
+    seeds: Tuple[int, ...] = (0,)
     sampler_seed: int = 42
     prune_percentile: float = 33
     n_startup_trials: int = 4
@@ -95,11 +92,11 @@ def suggest_params(trial: optuna.Trial) -> Dict[str, object]:
         "lrf": trial.suggest_float("lrf", 0.01, 0.2),
         "weight_decay": trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True),
         "optimizer": trial.suggest_categorical("optimizer", ["SGD", "AdamW"]),
-        "warmup_epochs": trial.suggest_int("warmup_epochs", 0, 5),
-        "freeze_backbone_epochs": trial.suggest_categorical("freeze_backbone_epochs", [0, 5, 10, 20]),
+        "warmup_epochs": trial.suggest_int("warmup_epochs", 0, 3),
+        "freeze_backbone_epochs": trial.suggest_categorical("freeze_backbone_epochs", [0, 2, 5, 8]),
         "backbone_lr_mult": trial.suggest_float("backbone_lr_mult", 0.1, 1.0),
         "mosaic": trial.suggest_float("mosaic", 0.0, 1.0),
-        "close_mosaic": trial.suggest_categorical("close_mosaic", [0, 10, 20]),
+        "close_mosaic": trial.suggest_categorical("close_mosaic", [0, 3, 5]),
         "mixup": trial.suggest_float("mixup", 0.0, 0.2),
     }
 
@@ -181,8 +178,33 @@ def tune_arm(cfg: DetectionEvalConfig, data_yaml: Path, arm: str, tcfg: TuningCo
     return study
 
 
+def evaluation_split(cfg: DetectionEvalConfig) -> str:
+    """Designated evaluation split: ``"test"`` when held out, else ``"val"``."""
+    return "test" if cfg.test_ratio > 0 else "val"
+
+
+def best_params_path(cfg: DetectionEvalConfig) -> Path:
+    """JSON file holding the best LeJEPA hyper-parameters."""
+    return cfg.output_dir / "optuna" / "best_params_lejepa.json"
+
+
+def save_best_params(cfg: DetectionEvalConfig, study: optuna.Study) -> Path:
+    """Write the best LeJEPA configuration to JSON and log it."""
+    path = best_params_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    states = dict(Counter(t.state.name for t in study.trials))
+    record = {"best_value_val_mAP50-95": study.best_value, "best_trial": study.best_trial.number,
+              "params": study.best_params, "trials": states}
+    path.write_text(json.dumps(record, indent=2))
+    print(f"Best LeJEPA configuration (val mAP50-95 = {study.best_value:.4f}, "
+          f"trial {study.best_trial.number}; trials: {states}) saved to {path}")
+    for key, value in study.best_params.items():
+        print(f"    {key}: {value}")
+    return path
+
+
 def run_tuning(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig()) -> Dict[str, optuna.Study]:
-    """Tune both arms with the same search space and ``n_trials``.
+    """Tune the LeJEPA arm only and save its best configuration.
 
     ``cfg.weights.lejepa_checkpoint`` must point at the pretrained encoder and
     ``cfg.test_ratio`` must be positive so a test split is held out.
@@ -197,27 +219,41 @@ def run_tuning(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig()) ->
         print("skip_tuning=True: using fixed hyper-parameters, no Optuna search.")
         return {}
     coco_state = coco_state_dict(cfg.weights)
-    return {arm: tune_arm(cfg, data_yaml, arm, tcfg, device, coco_state) for arm in TUNING_ARMS}
+    studies = {arm: tune_arm(cfg, data_yaml, arm, tcfg, device, coco_state) for arm in TUNED_ARMS}
+    for study in studies.values():
+        save_best_params(cfg, study)
+    return studies
 
 
-def _arm_params(arm: str, tcfg: TuningConfig, cfg: DetectionEvalConfig,
-                studies: Optional[Dict[str, optuna.Study]]) -> Dict[str, object]:
-    """Parameters for an arm: the fixed set when tuning is skipped, else the study's best."""
+def best_params(cfg: DetectionEvalConfig, tcfg: TuningConfig,
+                studies: Optional[Dict[str, optuna.Study]] = None) -> Dict[str, object]:
+    """Parameters shared by both final arms: the fixed set when tuning is skipped, else the LeJEPA best."""
     if tcfg.skip_tuning:
         return tcfg.fixed_params
-    return (studies[arm] if studies else load_study(cfg, arm, tcfg)).best_params
+    if studies and "lejepa_init" in studies:
+        return studies["lejepa_init"].best_params
+    path = best_params_path(cfg)
+    if path.exists():
+        return json.loads(path.read_text())["params"]
+    return load_study(cfg, "lejepa_init", tcfg).best_params
 
 
 def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
                  studies: Optional[Dict[str, optuna.Study]] = None) -> pd.DataFrame:
-    """Retrain each arm's best config for ``final_epochs`` with every seed.
+    """Train both arms for ``final_epochs`` with the best LeJEPA hyper-parameters.
+
+    The LeJEPA-init and COCO-init backbones use the identical pipeline and
+    parameters. Each model is scored on the evaluation split (the test split
+    when ``cfg.test_ratio > 0``, else validation), the primary benchmark, and
+    on the training split as a diagnostic.
 
     Returns
     -------
     pandas.DataFrame
-        One row per arm and seed with test mAP50 and mAP50-95; also saved to
+        One row per arm, seed and split (``"eval"`` or ``"train"``) with
+        precision, recall, F1, mAP50, mAP50-95 and mAP75; also saved to
         ``<output_dir>/optuna/final_runs.csv`` and ``final_summary.csv``
-        (mean and std per arm). Finished runs are reused on resume.
+        (evaluation split, mean ± std per arm). Finished runs are reused.
     """
     device = ultralytics_device(select_device(cfg.device))
     data_yaml = cfg.split_dir / "dataset.yaml"
@@ -226,157 +262,40 @@ def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
     coco_state = coco_state_dict(cfg.weights)
     folder = cfg.output_dir / "optuna"
     folder.mkdir(parents=True, exist_ok=True)
+    params = best_params(cfg, tcfg, studies)
+    print(f"Final training ({tcfg.final_epochs} epochs) of both arms with: {params}")
+    eval_split = evaluation_split(cfg)
     rows = []
     for arm in TUNING_ARMS:
         init = _init_weights(cfg, arm)
         for seed in tcfg.seeds:
             cache = folder / f"final_{arm}_seed{seed}.json"
-            if cache.exists():
-                rows.append(json.loads(cache.read_text()))
+            cached = json.loads(cache.read_text()) if cache.exists() else None
+            if isinstance(cached, list):  # older caches hold a single test-only dict and are re-run
+                rows.extend(cached)
                 continue
-            run_cfg = apply_params(cfg, _arm_params(arm, tcfg, cfg, studies), tcfg.final_epochs, seed)
+            run_cfg = apply_params(cfg, params, tcfg.final_epochs, seed)
             name = f"final_{arm}_seed{seed}"
             run_dir, _ = finetune_detector(init, data_yaml, run_cfg, name, device, coco_state,
                                            TUNING_ARMS[arm])
-            test = validate_detector(run_dir / "weights" / "best.pt", data_yaml, run_cfg, name, device,
-                                     split="test")
-            row = {"arm": arm, "seed": seed, "mAP50": test["mAP50"], "mAP50-95": test["mAP50-95"]}
-            cache.write_text(json.dumps(row))
-            rows.append(row)
+            best = run_dir / "weights" / "best.pt"
+            arm_rows = [{"arm": arm, "seed": seed, "split": label,
+                         **validate_detector(best, data_yaml, run_cfg, name, device, split=split)}
+                        for label, split in (("eval", eval_split), ("train", "train"))]
+            cache.write_text(json.dumps(arm_rows))
+            rows.extend(arm_rows)
     runs = pd.DataFrame(rows)
     runs.to_csv(folder / "final_runs.csv", index=False)
-    summary_table(runs).to_csv(folder / "final_summary.csv")
+    summary_table(runs[runs["split"] == "eval"]).to_csv(folder / "final_summary.csv")
     return runs
-
-
-def regime_dataset(split_dir: Path, fraction: float, out_dir: Path, seed: int) -> Tuple[Path, int]:
-    """Build a dataset whose train split is a nested random subset of ``split_dir``'s train split.
-
-    Val and test images are shared with the full split (symlinked folders), so every
-    regime is scored on identical images. Subsets are nested: smaller regimes are
-    prefixes of one seeded shuffle.
-    """
-    train_images = sorted((split_dir / "images" / "train").iterdir())
-    random.Random(seed).shuffle(train_images)
-    n = max(1, round(len(train_images) * fraction))
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    for sub in ("images", "labels"):
-        (out_dir / sub / "train").mkdir(parents=True)
-        for extra in ("val", "test"):
-            if (split_dir / sub / extra).exists():
-                (out_dir / sub / extra).symlink_to((split_dir / sub / extra).resolve())
-    for image in train_images[:n]:
-        shutil.copy2(image, out_dir / "images" / "train" / image.name)
-        label = split_dir / "labels" / "train" / f"{image.stem}.txt"
-        if label.exists():
-            shutil.copy2(label, out_dir / "labels" / "train" / label.name)
-    yaml_text = (split_dir / "dataset.yaml").read_text().replace(
-        str(split_dir.resolve()), str(out_dir.resolve()), 1)
-    yaml_path = out_dir / "dataset.yaml"
-    yaml_path.write_text(yaml_text)
-    return yaml_path, n
-
-
-def retrain_by_regime(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
-                      studies: Optional[Dict[str, optuna.Study]] = None) -> pd.DataFrame:
-    """Retrain the tuned LeJEPA-init and COCO-init arms at several training-set sizes.
-
-    Uses each arm's best tuned parameters, every seed in ``tcfg.seeds`` and the
-    fractions in ``tcfg.regime_fractions`` (smallest to largest). Metrics are on the
-    fixed test split. Results are saved to ``<output_dir>/optuna/regime_runs.csv``,
-    ``regime_summary.csv`` and ``regime_comparison.csv``; finished runs are reused.
-
-    Returns
-    -------
-    pandas.DataFrame
-        One row per regime, arm and seed.
-    """
-    device = ultralytics_device(select_device(cfg.device))
-    base_yaml = cfg.split_dir / "dataset.yaml"
-    if not base_yaml.exists():
-        raise FileNotFoundError(f"{base_yaml} not found; run run_tuning first.")
-    coco_state = coco_state_dict(cfg.weights)
-    folder = cfg.output_dir / "optuna"
-    rows = []
-    for fraction in sorted(tcfg.regime_fractions):
-        tag = f"frac{int(round(fraction * 100)):03d}"
-        data_yaml, n_train = regime_dataset(cfg.split_dir, fraction, cfg.output_dir / "regimes" / tag,
-                                            cfg.seed)
-        for arm in TUNING_ARMS:
-            init = _init_weights(cfg, arm)
-            for seed in tcfg.seeds:
-                cache = folder / f"regime_{tag}_{arm}_seed{seed}.json"
-                if cache.exists():
-                    rows.append(json.loads(cache.read_text()))
-                    continue
-                run_cfg = apply_params(cfg, _arm_params(arm, tcfg, cfg, studies), tcfg.final_epochs, seed)
-                name = f"regime_{tag}_{arm}_seed{seed}"
-                run_dir, _ = finetune_detector(init, data_yaml, run_cfg, name, device, coco_state,
-                                               TUNING_ARMS[arm])
-                test = validate_detector(run_dir / "weights" / "best.pt", data_yaml, run_cfg, name, device,
-                                         split="test")
-                row = {"regime": tag, "fraction": fraction, "n_train": n_train, "arm": arm, "seed": seed,
-                       "mAP50": test["mAP50"], "mAP50-95": test["mAP50-95"]}
-                cache.write_text(json.dumps(row))
-                rows.append(row)
-    runs = pd.DataFrame(rows)
-    runs.to_csv(folder / "regime_runs.csv", index=False)
-    regime_summary(runs).to_csv(folder / "regime_summary.csv")
-    regime_comparison(runs).to_csv(folder / "regime_comparison.csv")
-    return runs
-
-
-def regime_summary(runs: pd.DataFrame) -> pd.DataFrame:
-    """Mean ± std of test mAP per regime and arm."""
-    grouped = runs.groupby(["n_train", "arm"])[["mAP50", "mAP50-95"]]
-    mean, std = grouped.mean(), grouped.std(ddof=1).fillna(0.0)
-    return pd.DataFrame({m: [f"{a:.4f} ± {b:.4f}" for a, b in zip(mean[m], std[m])] for m in mean.columns},
-                        index=mean.index)
-
-
-def regime_comparison(runs: pd.DataFrame) -> pd.DataFrame:
-    """Side-by-side LeJEPA-init vs COCO-init test mAP per regime, with the LeJEPA gain."""
-    mean = runs.groupby(["n_train", "arm"])[["mAP50", "mAP50-95"]].mean().unstack("arm")
-    table = pd.DataFrame(index=mean.index)
-    for metric in ("mAP50", "mAP50-95"):
-        table[f"{metric} LeJEPA"] = mean[(metric, "lejepa_init")]
-        table[f"{metric} COCO"] = mean[(metric, "coco_init")]
-        table[f"{metric} gain"] = table[f"{metric} LeJEPA"] - table[f"{metric} COCO"]
-        table[f"{metric} gain %"] = 100 * table[f"{metric} gain"] / table[f"{metric} COCO"]
-    return table.sort_index().round(4)
-
-
-def plot_regime_bars(runs: pd.DataFrame, out_path: Optional[Path] = None):
-    """Grouped bars of test mAP (mean ± std over seeds) by training-set size, LeJEPA vs COCO."""
-    metrics = ("mAP50", "mAP50-95")
-    sizes = sorted(runs["n_train"].unique())
-    fig, axes = plt.subplots(1, len(metrics), figsize=(5 * len(metrics) + 1, 4.5), sharey=True)
-    width = 0.8 / len(TUNING_ARMS)
-    for ax, metric in zip(axes, metrics):
-        for i, (arm, variant) in enumerate(TUNING_ARMS.items()):
-            sub = runs[runs["arm"] == arm].groupby("n_train")[metric]
-            mean = sub.mean().reindex(sizes)
-            std = sub.std(ddof=1).reindex(sizes).fillna(0.0)
-            x = np.arange(len(sizes)) + (i - (len(TUNING_ARMS) - 1) / 2) * width
-            ax.bar(x, mean, width, yerr=std, capsize=3, label=display_variant_name(variant))
-        ax.set_xticks(np.arange(len(sizes)))
-        ax.set_xticklabels([str(n) for n in sizes])
-        ax.set(xlabel="Training images", ylabel=f"Test {metric}", title=metric)
-        ax.grid(True, axis="y", alpha=0.4)
-    axes[0].legend(fontsize=8)
-    fig.suptitle("LeJEPA vs COCO initialisation by data regime")
-    if out_path is not None:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    return fig
 
 
 def summary_table(runs: pd.DataFrame) -> pd.DataFrame:
-    """Mean ± std (sample std over seeds) of test mAP per arm."""
-    grouped = runs.groupby("arm")[["mAP50", "mAP50-95"]]
+    """Mean ± std (sample std over seeds) of the detection metrics per arm."""
+    metrics = [m for m in ("precision", "recall", "f1", "mAP50", "mAP50-95") if m in runs]
+    grouped = runs.groupby("arm")[metrics]
     table = grouped.mean().add_suffix("_mean").join(grouped.std(ddof=1).add_suffix("_std"))
-    for metric in ("mAP50", "mAP50-95"):
+    for metric in metrics:
         table[metric] = [f"{m:.4f} ± {s:.4f}" for m, s in
                          zip(table[f"{metric}_mean"], table[f"{metric}_std"].fillna(0.0))]
     return table

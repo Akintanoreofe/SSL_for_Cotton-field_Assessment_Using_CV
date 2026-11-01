@@ -53,6 +53,7 @@ from .core_pretraining import (
     save_encoder,
     select_device,
 )
+from .analysis import OverlapConfig, overlap_comparison, run_final_report, training_diagnostics
 from .pipeline import (
     run_all,
     run_detection_evaluation,
@@ -64,12 +65,8 @@ from .tuning import (
     RECOMMENDED_PARAMS,
     TuningConfig,
     plot_optimization_history,
-    plot_regime_bars,
     print_best_params,
-    regime_comparison,
-    regime_summary,
     retrain_best,
-    retrain_by_regime,
     run_tuning,
     summary_table,
 )
@@ -77,6 +74,10 @@ from .tuning import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "OverlapConfig",
+    "overlap_comparison",
+    "run_final_report",
+    "training_diagnostics",
     "VARIANTS",
     "DetectionEvalConfig",
     "GeM",
@@ -102,11 +103,7 @@ __all__ = [
     "TuningConfig",
     "plot_optimization_history",
     "print_best_params",
-    "plot_regime_bars",
-    "regime_comparison",
-    "regime_summary",
     "retrain_best",
-    "retrain_by_regime",
     "run_tuning",
     "summary_table",
     "discover_camera_groups",

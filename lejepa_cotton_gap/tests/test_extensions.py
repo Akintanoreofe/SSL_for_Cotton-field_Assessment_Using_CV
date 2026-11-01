@@ -382,6 +382,21 @@ def test_tuning_search_space_and_params():
     assert RECOMMENDED_PARAMS["lr0"] == 0.002
 
 
+def test_tuning_defaults_and_tuned_arm():
+    from lejepa_cotton.tuning import TUNED_ARMS, TuningConfig
+    tcfg = TuningConfig()
+    assert (tcfg.n_trials, tcfg.proxy_epochs, tcfg.final_epochs) == (100, 10, 30)
+    assert TUNED_ARMS == ("lejepa_init",)
+
+
+def test_occlusion_scores_flag_overlapping_boxes():
+    import numpy as np
+    from lejepa_cotton.analysis import occlusion_scores
+    boxes = np.array([[0, 0, 10, 10], [1, 1, 9, 9], [50, 50, 60, 60]], dtype=float)
+    iou, covered = occlusion_scores(boxes)
+    assert covered[1] == 1.0 and iou[0] > 0.6 and iou[2] == 0.0
+
+
 def test_coco_state_dict_explains_local_weights_fallback(monkeypatch):
     from lejepa_cotton import WeightSources
 
