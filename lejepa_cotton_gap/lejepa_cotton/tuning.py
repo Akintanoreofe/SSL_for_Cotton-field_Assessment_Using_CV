@@ -52,7 +52,7 @@ class TuningConfig:
 
     Parameters
     ----------
-    n_trials : int, default=100
+    n_trials : int, default=30
         Finished trials (complete, pruned or failed) of the LeJEPA study.
     prune_percentile : float, default=33
         Percentile threshold used by the pruning algorithm.
@@ -73,7 +73,7 @@ class TuningConfig:
         Parameters used when ``skip_tuning`` is True (same keys as :func:`suggest_params`).
     """
 
-    n_trials: int = 100
+    n_trials: int = 30
     proxy_epochs: int = 10
     final_epochs: int = 30
     seeds: Tuple[int, ...] = (0,)
