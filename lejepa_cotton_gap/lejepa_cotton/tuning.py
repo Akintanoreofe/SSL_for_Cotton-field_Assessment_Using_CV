@@ -85,6 +85,10 @@ class TuningConfig:
     fixed_params: Dict[str, object] = field(default_factory=lambda: dict(RECOMMENDED_PARAMS))
 
 
+# Bump when the search space changes: Optuna cannot resume a study whose categorical choices differ.
+SEARCH_SPACE_VERSION = "v2"
+
+
 def suggest_params(trial: optuna.Trial) -> Dict[str, object]:
     """Draw one configuration from the search space (same for every arm)."""
     return {
@@ -125,7 +129,7 @@ def study_storage(cfg: DetectionEvalConfig) -> str:
 def load_study(cfg: DetectionEvalConfig, arm: str, tcfg: TuningConfig) -> optuna.Study:
     """Create or resume the persisted study of an arm (TPE + percentile pruner)."""
     return optuna.create_study(
-        study_name=f"{arm}", storage=study_storage(cfg), direction="maximize", load_if_exists=True,
+        study_name=f"{arm}_{SEARCH_SPACE_VERSION}", storage=study_storage(cfg), direction="maximize", load_if_exists=True,
         sampler=optuna.samplers.TPESampler(seed=tcfg.sampler_seed),
         pruner=optuna.pruners.PercentilePruner(
             percentile=tcfg.prune_percentile,
