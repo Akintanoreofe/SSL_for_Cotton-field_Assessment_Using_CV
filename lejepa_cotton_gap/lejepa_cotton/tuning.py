@@ -403,10 +403,14 @@ def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
             if timeouts.count:
                 print(f"WARNING: {name} had {timeouts.count} NMS timeout(s) during training validation.")
             best = run_dir / "weights" / "best.pt"
-            arm_rows = [{"arm": arm, "seed": seed, "split": label,
-                         **validate_detector(best, data_yaml, run_cfg, name, device, split=split,
-                                           conf=FINAL_EVAL_CONF)}
-                        for label, split in (("eval", eval_split), ("train", "train"))]
+            # conf=0.001 floods NMS; without the patched time limit Ultralytics silently drops detections.
+            with tuning_nms(TUNING_MAX_NMS, TUNING_NMS_MAX_TIME_IMG, TUNING_NMS_ON_CPU) as timeouts:
+                arm_rows = [{"arm": arm, "seed": seed, "split": label,
+                             **validate_detector(best, data_yaml, run_cfg, name, device, split=split,
+                                                 conf=FINAL_EVAL_CONF, max_det=max_det)}
+                            for label, split in (("eval", eval_split), ("train", "train"))]
+            if timeouts.count:
+                print(f"WARNING: {name} had {timeouts.count} NMS timeout(s) during final scoring.")
             cache.write_text(json.dumps(arm_rows))
             rows.extend(arm_rows)
     runs = pd.DataFrame(rows)
