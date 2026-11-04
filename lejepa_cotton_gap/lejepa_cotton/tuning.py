@@ -386,7 +386,7 @@ def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
     for arm in TUNING_ARMS:
         init = _init_weights(cfg, arm)
         for seed in tcfg.seeds:
-            cache = folder / f"final_{arm}_seed{seed}.json"
+            cache = folder / f"final_{arm}_ep{arm_epochs[arm]}_seed{seed}.json"
             cached = json.loads(cache.read_text()) if cache.exists() else None
             if isinstance(cached, list):  # older caches hold a single test-only dict and are re-run
                 rows.extend(cached)
