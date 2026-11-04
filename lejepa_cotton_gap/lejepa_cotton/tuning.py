@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import shutil
 import time
 from collections import Counter
 from dataclasses import dataclass, field, replace
@@ -47,8 +49,8 @@ TUNING_VAL_CONF = 0.05
 TUNING_MAX_DET = 300           # raised per dataset if any val image has more than ~250 GT boxes
 TUNING_MAX_NMS = 3000          # candidates per image fed to NMS (Ultralytics default 30000); only settable by patch
 # Time limit per NMS call is 2 + max_time_img * batch seconds; make it huge so it never truncates tuning results.
-TUNING_NMS_MAX_TIME_IMG = 60.0
-TUNING_NMS_ON_CPU = False      # set True if benchmark_val_pass shows CPU NMS is faster on MPS
+TUNING_NMS_MAX_TIME_IMG = float("inf")  # no time limit, so "NMS time limit exceeded" can never truncate results
+TUNING_NMS_ON_CPU = True       # one CPU transfer per batch avoids slow per-image NMS ops on MPS (mid-epoch stalls)
 # --- Final (paper) evaluation: standard COCO-style settings ---
 FINAL_EVAL_CONF = 0.001
 
@@ -184,6 +186,11 @@ def load_study(cfg: DetectionEvalConfig, arm: str, tcfg: TuningConfig) -> optuna
 
 def _init_weights(cfg: DetectionEvalConfig, arm: str) -> str:
     return detection_init_weights(TUNING_ARMS[arm], cfg.weights, cfg.init_dir, f"tune_{arm}")
+
+
+def final_workers(cfg: DetectionEvalConfig) -> int:
+    """Data-loading workers for final training so mosaic/augmentation does not starve the GPU."""
+    return max(cfg.workers, min(8, (os.cpu_count() or 2) - 1))
 
 
 def tuning_max_det(cfg: DetectionEvalConfig) -> int:
@@ -387,26 +394,23 @@ def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
     for arm in TUNING_ARMS:
         init = _init_weights(cfg, arm)
         for seed in tcfg.seeds:
-            cache = folder / f"final_{arm}_ep{arm_epochs[arm]}_seed{seed}.json"
-            cached = json.loads(cache.read_text()) if cache.exists() else None
-            if isinstance(cached, list):  # older caches hold a single test-only dict and are re-run
-                rows.extend(cached)
-                continue
             run_cfg = apply_params(cfg, params, arm_epochs[arm], seed)
             name = f"final_{arm}_seed{seed}"
-            best = cfg.runs_dir / name / "weights" / "best.pt"
-            if best.exists():
-                # Weights from a finished run are reused; only the scoring is redone.
-                print(f"[{name}] reusing trained weights {best}; rescoring only.")
-            else:
-                train_cfg = replace(run_cfg, val_conf=TUNING_VAL_CONF,
-                                    train_overrides={**run_cfg.train_overrides, "max_det": max_det})
-                with tuning_nms(TUNING_MAX_NMS, TUNING_NMS_MAX_TIME_IMG, TUNING_NMS_ON_CPU) as timeouts:
-                    run_dir, _ = finetune_detector(init, data_yaml, train_cfg, name, device, coco_state,
-                                                   TUNING_ARMS[arm])
-                if timeouts.count:
-                    print(f"WARNING: {name} had {timeouts.count} NMS timeout(s) during training validation.")
-                best = run_dir / "weights" / "best.pt"
+            # Always fine-tune from the pretrained initialisation: stored runs and score caches are discarded.
+            shutil.rmtree(cfg.runs_dir / name, ignore_errors=True)
+            for stale in folder.glob(f"final_{arm}_ep*_seed{seed}.json"):
+                stale.unlink()
+            cache = folder / f"final_{arm}_ep{arm_epochs[arm]}_seed{seed}.json"
+            train_cfg = replace(run_cfg, val_conf=TUNING_VAL_CONF, workers=final_workers(run_cfg),
+                                train_overrides={**run_cfg.train_overrides, "max_det": max_det,
+                                                 "cache": "ram"})
+            print(f"[{name}] training {arm_epochs[arm]} epochs from {init}", flush=True)
+            with tuning_nms(TUNING_MAX_NMS, TUNING_NMS_MAX_TIME_IMG, TUNING_NMS_ON_CPU) as timeouts:
+                run_dir, _ = finetune_detector(init, data_yaml, train_cfg, name, device, coco_state,
+                                               TUNING_ARMS[arm])
+            if timeouts.count:
+                print(f"WARNING: {name} had {timeouts.count} NMS timeout(s) during training validation.")
+            best = run_dir / "weights" / "best.pt"
             # conf=0.001 floods NMS; without the patched time limit Ultralytics silently drops detections.
             with tuning_nms(TUNING_MAX_NMS, TUNING_NMS_MAX_TIME_IMG, TUNING_NMS_ON_CPU) as timeouts:
                 arm_rows = [{"arm": arm, "seed": seed, "split": label,
