@@ -382,6 +382,7 @@ def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
     arm_epochs = {"lejepa_init": tcfg.lejepa_final_epochs or tcfg.final_epochs, "coco_init": tcfg.final_epochs}
     print(f"Final training (epochs {arm_epochs}) of both arms with: {params}")
     eval_split = evaluation_split(cfg)
+    max_det = tuning_max_det(cfg)
     rows = []
     for arm in TUNING_ARMS:
         init = _init_weights(cfg, arm)
@@ -393,8 +394,14 @@ def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
                 continue
             run_cfg = apply_params(cfg, params, arm_epochs[arm], seed)
             name = f"final_{arm}_seed{seed}"
-            run_dir, _ = finetune_detector(init, data_yaml, run_cfg, name, device, coco_state,
-                                           TUNING_ARMS[arm])
+            # Per-epoch validation only; the final scoring below keeps stock NMS settings.
+            train_cfg = replace(run_cfg, val_conf=TUNING_VAL_CONF,
+                                train_overrides={**run_cfg.train_overrides, "max_det": max_det})
+            with tuning_nms(TUNING_MAX_NMS, TUNING_NMS_MAX_TIME_IMG, TUNING_NMS_ON_CPU) as timeouts:
+                run_dir, _ = finetune_detector(init, data_yaml, train_cfg, name, device, coco_state,
+                                               TUNING_ARMS[arm])
+            if timeouts.count:
+                print(f"WARNING: {name} had {timeouts.count} NMS timeout(s) during training validation.")
             best = run_dir / "weights" / "best.pt"
             arm_rows = [{"arm": arm, "seed": seed, "split": label,
                          **validate_detector(best, data_yaml, run_cfg, name, device, split=split,
