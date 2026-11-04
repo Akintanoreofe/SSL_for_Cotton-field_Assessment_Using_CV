@@ -74,7 +74,9 @@ class TuningConfig:
     proxy_epochs : int, default=10
         Epochs per tuning trial.
     final_epochs : int, default=30
-        Epochs of the final training of both arms.
+        Epochs of the final training (COCO arm, and LeJEPA arm unless overridden).
+    lejepa_final_epochs : int, optional
+        Final-training epochs of the LeJEPA arm; defaults to ``final_epochs``.
     seeds : tuple of int, default=(0,)
         Final-training seeds.
     sampler_seed : int, default=42
@@ -91,6 +93,7 @@ class TuningConfig:
     n_trials: int = 30
     proxy_epochs: int = 10
     final_epochs: int = 30
+    lejepa_final_epochs: Optional[int] = None
     seeds: Tuple[int, ...] = (0,)
     sampler_seed: int = 42
     prune_percentile: float = 33
@@ -376,7 +379,8 @@ def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
     folder = cfg.output_dir / "optuna"
     folder.mkdir(parents=True, exist_ok=True)
     params = best_params(cfg, tcfg, studies)
-    print(f"Final training ({tcfg.final_epochs} epochs) of both arms with: {params}")
+    arm_epochs = {"lejepa_init": tcfg.lejepa_final_epochs or tcfg.final_epochs, "coco_init": tcfg.final_epochs}
+    print(f"Final training (epochs {arm_epochs}) of both arms with: {params}")
     eval_split = evaluation_split(cfg)
     rows = []
     for arm in TUNING_ARMS:
@@ -387,7 +391,7 @@ def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
             if isinstance(cached, list):  # older caches hold a single test-only dict and are re-run
                 rows.extend(cached)
                 continue
-            run_cfg = apply_params(cfg, params, tcfg.final_epochs, seed)
+            run_cfg = apply_params(cfg, params, arm_epochs[arm], seed)
             name = f"final_{arm}_seed{seed}"
             run_dir, _ = finetune_detector(init, data_yaml, run_cfg, name, device, coco_state,
                                            TUNING_ARMS[arm])

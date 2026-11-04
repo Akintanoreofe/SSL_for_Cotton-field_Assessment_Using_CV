@@ -448,7 +448,7 @@ def run_final_report(cfg: DetectionEvalConfig, runs: pd.DataFrame, tcfg: TuningC
     seed = tcfg.seeds[0]
     primary = runs[(runs["split"] == "eval") & (runs["seed"] == seed)].set_index("arm")[list(METRICS)]
     primary = primary.rename(index={a: display_variant_name(v) for a, v in TUNING_ARMS.items()})
-    sections = [f"## Primary benchmark: {split} split ({tcfg.final_epochs} epochs, identical pipeline)", "",
+    sections = [f"## Primary benchmark: {split} split", "",
                 _markdown(primary.round(4)), ""]
     print("\n".join(sections))
     overlap = overlap_comparison(cfg, tcfg, ocfg)
