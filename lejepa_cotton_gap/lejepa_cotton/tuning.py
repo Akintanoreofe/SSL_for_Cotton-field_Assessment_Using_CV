@@ -394,15 +394,19 @@ def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
                 continue
             run_cfg = apply_params(cfg, params, arm_epochs[arm], seed)
             name = f"final_{arm}_seed{seed}"
-            # Per-epoch validation only; the final scoring below keeps stock NMS settings.
-            train_cfg = replace(run_cfg, val_conf=TUNING_VAL_CONF,
-                                train_overrides={**run_cfg.train_overrides, "max_det": max_det})
-            with tuning_nms(TUNING_MAX_NMS, TUNING_NMS_MAX_TIME_IMG, TUNING_NMS_ON_CPU) as timeouts:
-                run_dir, _ = finetune_detector(init, data_yaml, train_cfg, name, device, coco_state,
-                                               TUNING_ARMS[arm])
-            if timeouts.count:
-                print(f"WARNING: {name} had {timeouts.count} NMS timeout(s) during training validation.")
-            best = run_dir / "weights" / "best.pt"
+            best = cfg.runs_dir / name / "weights" / "best.pt"
+            if best.exists():
+                # Weights from a finished run are reused; only the scoring is redone.
+                print(f"[{name}] reusing trained weights {best}; rescoring only.")
+            else:
+                train_cfg = replace(run_cfg, val_conf=TUNING_VAL_CONF,
+                                    train_overrides={**run_cfg.train_overrides, "max_det": max_det})
+                with tuning_nms(TUNING_MAX_NMS, TUNING_NMS_MAX_TIME_IMG, TUNING_NMS_ON_CPU) as timeouts:
+                    run_dir, _ = finetune_detector(init, data_yaml, train_cfg, name, device, coco_state,
+                                                   TUNING_ARMS[arm])
+                if timeouts.count:
+                    print(f"WARNING: {name} had {timeouts.count} NMS timeout(s) during training validation.")
+                best = run_dir / "weights" / "best.pt"
             # conf=0.001 floods NMS; without the patched time limit Ultralytics silently drops detections.
             with tuning_nms(TUNING_MAX_NMS, TUNING_NMS_MAX_TIME_IMG, TUNING_NMS_ON_CPU) as timeouts:
                 arm_rows = [{"arm": arm, "seed": seed, "split": label,
