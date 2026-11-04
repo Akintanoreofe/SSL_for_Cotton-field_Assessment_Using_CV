@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import time
 from collections import Counter
 from copy import deepcopy
 from functools import partial
@@ -1397,7 +1398,12 @@ class ProbeEvalConfig:
     batch_size : int, default=16
         Batch size.
     epochs : int, default=50
-        Probe training epochs.
+        Probe training epochs (LeJEPA and any non-COCO variant).
+    coco_epochs : int or None, default=10
+        Epochs for the COCO variant, which converges faster; ``None`` uses
+        ``epochs``.
+    log_every : int, default=1
+        Print losses every this many epochs (0 disables epoch logging).
     lr : float, default=0.017711616697652244
         Adam learning rate.
     weight_decay : float, default=1.009744159203988e-06
@@ -1428,6 +1434,8 @@ class ProbeEvalConfig:
     image_size: int = 256
     batch_size: int = 16
     epochs: int = 50
+    coco_epochs: Optional[int] = 10
+    log_every: int = 1
     lr: float = 0.017711616697652244
     weight_decay: float = 1.009744159203988e-06
     dropout: float = 0.3
@@ -1447,6 +1455,12 @@ class ProbeEvalConfig:
     def class_names(self) -> List[str]:
         """list of str : Class names ordered by index."""
         return sorted(self.label_mapping, key=self.label_mapping.get)
+
+    def epochs_for(self, variant: str) -> int:
+        """int : Probe epochs of a variant (``coco_epochs`` for COCO variants)."""
+        if variant.startswith("coco") and self.coco_epochs is not None:
+            return self.coco_epochs
+        return self.epochs
 
 
 def build_probe_loaders(cfg: ProbeEvalConfig) -> Tuple[DataLoader, DataLoader]:
@@ -1630,8 +1644,11 @@ def predict(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple
 
 
 def train_linear_probe(probe: LinearProbe, train_loader: DataLoader, test_loader: DataLoader,
-                       cfg: ProbeEvalConfig, device: torch.device) -> pd.DataFrame:
+                       cfg: ProbeEvalConfig, device: torch.device, variant: str = "") -> pd.DataFrame:
     """Train a probe and restore the weights with the lowest test loss.
+
+    The backbone is frozen and the images are not augmented, so the pooled
+    features are extracted once and only the linear head is trained on them.
 
     Parameters
     ----------
@@ -1645,21 +1662,51 @@ def train_linear_probe(probe: LinearProbe, train_loader: DataLoader, test_loader
         Probe configuration.
     device : torch.device
         Compute device.
+    variant : str, default=""
+        Variant name; selects the epoch budget and labels the log lines.
 
     Returns
     -------
     pandas.DataFrame
         Columns ``epoch``, ``train_loss`` and ``test_loss``.
     """
+    epochs = cfg.epochs_for(variant) if variant else cfg.epochs
+    tag = f"[{variant}] " if variant else ""
+    started = time.time()
+    train_x, train_y = extract_embeddings(probe, train_loader)
+    test_x, test_y = extract_embeddings(probe, test_loader)
+    print(f"{tag}extracted features: {len(train_y)} train, {len(test_y)} test "
+          f"({time.time() - started:.1f}s); training head for {epochs} epochs", flush=True)
+    train_x, test_x = torch.as_tensor(train_x, device=device), torch.as_tensor(test_x, device=device)
+    train_y, test_y = torch.as_tensor(train_y, device=device), torch.as_tensor(test_y, device=device)
     optimizer = torch.optim.Adam(probe.classifier.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    criterion = nn.CrossEntropyLoss()
+    generator = torch.Generator().manual_seed(cfg.seed)
     best_loss, best_state, records = float("inf"), None, []
-    for epoch in range(cfg.epochs):
-        train_loss = train_probe_epoch(probe, train_loader, optimizer, device)
-        _, _, test_loss = predict(probe, test_loader, device)
+    for epoch in range(epochs):
+        probe.train()
+        total = 0.0
+        for index in torch.randperm(len(train_y), generator=generator).split(cfg.batch_size):
+            index = index.to(device)
+            loss = criterion(probe.classifier(probe.dropout(train_x[index])), train_y[index])
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            total += float(loss.detach().cpu()) * len(index)
+        train_loss = total / max(1, len(train_y))
+        probe.eval()
+        with torch.no_grad():
+            logits = probe.classifier(test_x)
+            test_loss = float(criterion(logits, test_y).cpu())
+            test_acc = float((logits.argmax(dim=1) == test_y).float().mean().cpu())
         records.append({"epoch": epoch + 1, "train_loss": train_loss, "test_loss": test_loss})
         if test_loss < best_loss:
             best_loss, best_state = test_loss, deepcopy(probe.state_dict())
+        if cfg.log_every and ((epoch + 1) % cfg.log_every == 0 or epoch + 1 == epochs):
+            print(f"{tag}epoch {epoch + 1}/{epochs} train_loss={train_loss:.4f} "
+                  f"test_loss={test_loss:.4f} test_acc={test_acc:.4f} best_loss={best_loss:.4f}", flush=True)
     probe.load_state_dict(best_state)
+    print(f"{tag}done in {time.time() - started:.1f}s (best test_loss={best_loss:.4f})", flush=True)
     return pd.DataFrame(records)
 
 
@@ -1689,7 +1736,7 @@ def fit_probe_variant(variant: str, cfg: ProbeEvalConfig, train_loader: DataLoad
     device = select_device(cfg.device)
     backbone = build_backbone_for_variant(variant, cfg.weights)
     probe = LinearProbe(backbone, len(cfg.label_mapping), cfg.dropout, cfg.scales).to(device)
-    return probe, train_linear_probe(probe, train_loader, test_loader, cfg, device)
+    return probe, train_linear_probe(probe, train_loader, test_loader, cfg, device, variant)
 
 
 def classification_summary(labels: np.ndarray, predictions: np.ndarray,

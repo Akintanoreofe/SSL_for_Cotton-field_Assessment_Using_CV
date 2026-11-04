@@ -30,7 +30,17 @@ from .core_evaluation import (
     yolo_to_xyxy,
 )
 from .core_pretraining import list_images, load_rgb, select_device
-from .tuning import TUNING_ARMS, TuningConfig, evaluation_split
+from .nms_tuning import tuning_nms
+from .tuning import (
+    FINAL_EVAL_CONF,
+    TUNING_ARMS,
+    TUNING_MAX_NMS,
+    TUNING_NMS_MAX_TIME_IMG,
+    TUNING_NMS_ON_CPU,
+    TuningConfig,
+    evaluation_split,
+    tuning_max_det,
+)
 
 METRICS = ("precision", "recall", "f1", "mAP50", "mAP50-95")
 
@@ -226,12 +236,18 @@ def overlap_comparison(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConf
         return {"metrics": pd.DataFrame(), "image_table": table, "text": text}
     seed = tcfg.seeds[0]
     image_dir, label_dir = cfg.split_dir / "images" / split, cfg.split_dir / "labels" / split
+    max_det = tuning_max_det(cfg)
     rows, predictions, occlusion = [], {}, []
     for arm in TUNING_ARMS:
         weights = _final_weights(cfg, arm, seed)
-        scores = validate_detector(weights, data_yaml, cfg, f"overlap_{arm}", device, split="val")
+        # Same scoped NMS patch as final scoring: no time limit (it silently drops detections) and CPU NMS on MPS.
+        with tuning_nms(TUNING_MAX_NMS, TUNING_NMS_MAX_TIME_IMG, TUNING_NMS_ON_CPU) as timeouts:
+            scores = validate_detector(weights, data_yaml, cfg, f"overlap_{arm}", device, split="val",
+                                       conf=FINAL_EVAL_CONF, max_det=max_det)
+            predictions[arm] = predict_images(weights, image_dir, label_dir, names, ocfg, cfg.image_size, device)
+        if timeouts.count:
+            print(f"WARNING: overlap analysis of {arm} had {timeouts.count} NMS timeout(s).")
         rows.append({"arm": arm, "images": len(names), **{m: scores[m] for m in METRICS}})
-        predictions[arm] = predict_images(weights, image_dir, label_dir, names, ocfg, cfg.image_size, device)
         hit = np.concatenate([p["hit"] for p in predictions[arm].values()])
         occ = np.concatenate([p["occluded"] for p in predictions[arm].values()])
         occlusion.append({"arm": arm, "occluded_boxes": int(occ.sum()),
