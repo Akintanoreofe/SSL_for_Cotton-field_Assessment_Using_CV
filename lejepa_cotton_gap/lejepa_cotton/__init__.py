@@ -59,6 +59,7 @@ from .pipeline import (
     run_detection_evaluation,
     run_pretraining,
     run_probe_evaluation,
+    run_probe_roc,
 )
 from .predict_video import predict_video
 from .tuning import (
@@ -119,6 +120,7 @@ __all__ = [
     "run_detection_evaluation",
     "run_pretraining",
     "run_probe_evaluation",
+    "run_probe_roc",
     "save_encoder",
     "select_device",
     "verify_backbone_transfer",

@@ -12,6 +12,7 @@ from functools import partial
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Set, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
@@ -334,3 +335,37 @@ def run_all(pretrain_cfg: PretrainConfig, detection_cfg: Optional[DetectionEvalC
             cfg.weights.lejepa_checkpoint = checkpoint
             results[key] = runner(cfg)
     return results
+
+def run_probe_roc(cfg: ProbeEvalConfig) -> Path:
+    """Refit the linear probes and plot one-vs-rest ROC curves on the test split.
+
+    The probe head is cheap to train and is not saved by
+    :func:`run_probe_evaluation`, so it is refitted with the same seed and
+    split; the backbones are loaded from ``cfg.weights``.
+
+    Parameters
+    ----------
+    cfg : ProbeEvalConfig
+        Linear-probe configuration (``variants`` selects the models).
+
+    Returns
+    -------
+    pathlib.Path
+        The written ROC figure.
+    """
+    from .visualization import save_roc_curves
+
+    device = select_device(cfg.device)
+    train_loader, test_loader = build_probe_loaders(cfg)
+    scores = {}
+    for variant in cfg.variants:
+        probe, _ = fit_probe_variant(variant, cfg, train_loader, test_loader)
+        probe.eval()
+        probs, labels = [], []
+        with torch.no_grad():
+            for images, targets in test_loader:
+                probs.append(torch.softmax(probe(images.to(device)), dim=1).cpu().numpy())
+                labels.append(targets.numpy())
+        scores[variant] = np.concatenate(probs)
+    return save_roc_curves(scores, np.concatenate(labels), cfg.class_names,
+                           cfg.output_dir / "plots" / "roc_curves.png")
