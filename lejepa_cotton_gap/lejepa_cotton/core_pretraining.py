@@ -117,8 +117,8 @@ class PretrainConfig:
     lam : float, default=SIGREG_LAMBDA (0.05)
         Weight of SIGReg; the prediction loss is weighted by ``1 - lam``.
         There is no lambda sweep: this is the single SIGReg weight.
-    use_local_sigreg : bool, default=True
-        Add the local path: a 1x1-conv projector on P3 whose per-location
+    use_local_sigreg : bool, default=False
+        Optionally add the local path: a 1x1-conv projector on P3 whose per-location
         tokens (a random subsample per batch) are regularised by SIGReg.
         No prediction loss is applied to tokens.
     local_sigreg_weight : float, default=SIGREG_LAMBDA
@@ -174,7 +174,7 @@ class PretrainConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     lam: float = SIGREG_LAMBDA
-    use_local_sigreg: bool = True
+    use_local_sigreg: bool = False
     local_sigreg_weight: float = SIGREG_LAMBDA
     tokens_per_batch: int = 4096
     pred_loss_mode: Optional[str] = None
