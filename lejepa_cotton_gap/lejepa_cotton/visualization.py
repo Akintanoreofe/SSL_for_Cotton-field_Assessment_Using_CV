@@ -13,6 +13,8 @@ import pandas as pd
 import plotly.express as px
 from PIL import ImageDraw
 from sklearn.decomposition import PCA
+from sklearn.metrics import auc, roc_curve
+from sklearn.preprocessing import label_binarize
 from ultralytics import YOLO
 
 from .core_evaluation import display_variant_name, load_training_log, read_yolo_labels, yolo_to_xyxy
@@ -206,6 +208,39 @@ def save_box_comparison(boxes_csv: Path, image_dir: Path, out_path: Path, max_im
         ax.imshow(image)
         ax.set_title(f"{image_id} (green=GT, red=pred)", fontsize=8)
         ax.axis("off")
+    return save_figure(fig, out_path)
+
+
+def save_roc_curves(scores: Dict[str, np.ndarray], labels: np.ndarray, class_names: Sequence[str],
+                    out_path: Path) -> Path:
+    """One-vs-rest ROC curves per class, one panel per class, variants overlaid.
+
+    Parameters
+    ----------
+    scores : dict of str to numpy.ndarray
+        Variant name to class probabilities of shape ``(N, num_classes)``.
+    labels : numpy.ndarray
+        True class indices, shape ``(N,)``.
+    class_names : sequence of str
+        Names ordered by class index.
+    out_path : pathlib.Path
+        Destination ``.png``.
+
+    Returns
+    -------
+    pathlib.Path
+        The written file.
+    """
+    indices = list(range(len(class_names)))
+    onehot = label_binarize(labels, classes=indices)
+    fig, axes = plt.subplots(1, len(indices), figsize=(5 * len(indices), 4.5), squeeze=False)
+    for ax, index, name in zip(axes[0], indices, class_names):
+        for variant, prob in scores.items():
+            fpr, tpr, _ = roc_curve(onehot[:, index], prob[:, index])
+            ax.plot(fpr, tpr, label=f"{display_variant_name(variant)} (AUC={auc(fpr, tpr):.3f})")
+        ax.plot([0, 1], [0, 1], "k--", linewidth=0.8)
+        ax.set(title=name, xlabel="False positive rate", ylabel="True positive rate")
+        ax.legend(loc="lower right", fontsize=8)
     return save_figure(fig, out_path)
 
 
