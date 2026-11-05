@@ -346,7 +346,7 @@ def test_defaults_match_new_pretraining_spec(tmp_path):
     cfg = PretrainConfig(image_root=tmp_path, output_dir=tmp_path)
     assert core_pretraining.SIGREG_LAMBDA == cfg.lam == 0.05
     assert cfg.prediction_pairing == "intra_image"
-    assert cfg.use_local_sigreg and cfg.tokens_per_batch == 4096
+    assert not cfg.use_local_sigreg and cfg.tokens_per_batch == 4096
     assert cfg.gem.p_init == 3.0 and not cfg.gem.learnable_p
     assert not hasattr(cfg, "lambdas")
 

@@ -311,9 +311,7 @@ def _overlap_text(metrics: pd.DataFrame, occ: pd.DataFrame, wins: Dict[str, int]
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------- #
 # Training-set diagnostics
-# --------------------------------------------------------------------------- #
 def label_quality(split_dir: Path, split: str) -> Dict[str, float]:
     """Simple annotation statistics of a split."""
     image_dir, label_dir = split_dir / "images" / split, split_dir / "labels" / split

@@ -78,9 +78,7 @@ class RotationConfig:
             raise ValueError("rotation.max_deg must be in [0, 15] and rotation.p must lie in [0, 1].")
 
 
-# --------------------------------------------------------------------------- #
 # Configuration and device
-# --------------------------------------------------------------------------- #
 @dataclass
 class PretrainConfig:
     """Hyper-parameters and paths for LeJEPA pretraining.
@@ -117,8 +115,8 @@ class PretrainConfig:
     lam : float, default=SIGREG_LAMBDA (0.05)
         Weight of SIGReg; the prediction loss is weighted by ``1 - lam``.
         There is no lambda sweep: this is the single SIGReg weight.
-    use_local_sigreg : bool, default=True
-        Add the local path: a 1x1-conv projector on P3 whose per-location
+    use_local_sigreg : bool, default=False
+        Optionally add the local path: a 1x1-conv projector on P3 whose per-location
         tokens (a random subsample per batch) are regularised by SIGReg.
         No prediction loss is applied to tokens.
     local_sigreg_weight : float, default=SIGREG_LAMBDA
@@ -174,7 +172,7 @@ class PretrainConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     lam: float = SIGREG_LAMBDA
-    use_local_sigreg: bool = True
+    use_local_sigreg: bool = False
     local_sigreg_weight: float = SIGREG_LAMBDA
     tokens_per_batch: int = 4096
     pred_loss_mode: Optional[str] = None
@@ -315,9 +313,7 @@ def select_device(preferred: Optional[str] = None) -> torch.device:
     return torch.device("cpu")
 
 
-# --------------------------------------------------------------------------- #
 # Files and sampling
-# --------------------------------------------------------------------------- #
 def list_images(root: Path, extensions: Sequence[str] = IMAGE_EXTENSIONS) -> List[Path]:
     """Recursively list image files under a folder.
 
@@ -424,9 +420,7 @@ def discover_camera_groups(
     return complete
 
 
-# --------------------------------------------------------------------------- #
 # Augmentation and dataset
-# --------------------------------------------------------------------------- #
 class RandomRotationReflect:
     """Sample an independent, reflect-padded rotation for each transformed view."""
 
@@ -761,9 +755,7 @@ def build_pretraining_loader(cfg: PretrainConfig, verbose: bool = True) -> DataL
     return make_loader(build_pretraining_dataset(cfg, verbose), cfg)
 
 
-# --------------------------------------------------------------------------- #
 # Backbone and encoder
-# --------------------------------------------------------------------------- #
 def global_average_pool(feature_map: torch.Tensor) -> torch.Tensor:
     """Global average pooling of a feature map.
 
@@ -1106,9 +1098,7 @@ class YOLOv8GAPEncoder(nn.Module):
         return torch.cat(list(self.project(images).values()), dim=-1)
 
 
-# --------------------------------------------------------------------------- #
 # Objective
-# --------------------------------------------------------------------------- #
 class SIGReg(nn.Module):
     """Sketched isotropic Gaussian regulariser (Epps-Pulley statistic).
 
@@ -1379,9 +1369,7 @@ def lejepa_loss(
     return loss, {k: v.detach() for k, v in logs.items()}
 
 
-# --------------------------------------------------------------------------- #
 # Training
-# --------------------------------------------------------------------------- #
 def train_one_epoch(
     encoder: YOLOv8GAPEncoder,
     loader: DataLoader,
@@ -1606,9 +1594,7 @@ def pretrain(
     return encoder, pd.DataFrame(records)
 
 
-# --------------------------------------------------------------------------- #
 # Checkpoints and export
-# --------------------------------------------------------------------------- #
 def save_encoder(encoder: YOLOv8GAPEncoder, path: Path, cfg: Optional[PretrainConfig] = None) -> Path:
     """Save encoder weights and the arguments needed to rebuild it.
 

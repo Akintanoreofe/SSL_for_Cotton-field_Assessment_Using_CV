@@ -42,7 +42,7 @@ TUNING_ARMS: Dict[str, str] = {"lejepa_init": "lejepa", "coco_init": "coco_backb
 TUNED_ARMS: Tuple[str, ...] = ("lejepa_init",)  # only the LeJEPA backbone is searched
 VAL_METRIC_KEY = "metrics/mAP50-95(B)"
 
-# --- Tuning-time validation settings (identical in every trial; NOT the paper's final-eval settings) ---
+# Tuning-time validation settings (identical in every trial; NOT the paper's final-eval settings)
 # conf=0.001 / conf=0.01 flood NMS with low-score boxes (very slow on MPS, trips the NMS time limit and
 # silently drops detections). A higher threshold is used only to rank trials.
 TUNING_VAL_CONF = 0.05
@@ -51,7 +51,7 @@ TUNING_MAX_NMS = 3000          # candidates per image fed to NMS (Ultralytics de
 # Time limit per NMS call is 2 + max_time_img * batch seconds; make it huge so it never truncates tuning results.
 TUNING_NMS_MAX_TIME_IMG = float("inf")  # no time limit, so "NMS time limit exceeded" can never truncate results
 TUNING_NMS_ON_CPU = True       # one CPU transfer per batch avoids slow per-image NMS ops on MPS (mid-epoch stalls)
-# --- Final (paper) evaluation: standard COCO-style settings ---
+# Final (paper) evaluation: standard COCO-style settings
 FINAL_EVAL_CONF = 0.001
 
 # Recommended configuration for small labelled sets (~200 images) with a pretrained backbone
