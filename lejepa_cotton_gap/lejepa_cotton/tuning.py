@@ -362,8 +362,13 @@ def best_params(cfg: DetectionEvalConfig, tcfg: TuningConfig,
 
 
 def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
-                 studies: Optional[Dict[str, optuna.Study]] = None) -> pd.DataFrame:
+                 studies: Optional[Dict[str, optuna.Study]] = None,
+                 reuse_existing: bool = False) -> pd.DataFrame:
     """Train both arms for ``final_epochs`` with the best LeJEPA hyper-parameters.
+
+    With ``reuse_existing=True`` an arm/seed whose run finished with the same epoch count
+    (``best.pt`` and its score cache exist) is not retrained; its stored scores are reused.
+    The default retrains everything.
 
     The LeJEPA-init and COCO-init backbones use the identical pipeline and
     parameters. Each model is scored on the evaluation split (the test split
@@ -396,11 +401,15 @@ def retrain_best(cfg: DetectionEvalConfig, tcfg: TuningConfig = TuningConfig(),
         for seed in tcfg.seeds:
             run_cfg = apply_params(cfg, params, arm_epochs[arm], seed)
             name = f"final_{arm}_seed{seed}"
-            # Always fine-tune from the pretrained initialisation: stored runs and score caches are discarded.
+            cache = folder / f"final_{arm}_ep{arm_epochs[arm]}_seed{seed}.json"
+            if reuse_existing and cache.exists() and (cfg.runs_dir / name / "weights" / "best.pt").exists():
+                print(f"[{name}] reusing finished run and scores ({cache.name})", flush=True)
+                rows.extend(json.loads(cache.read_text()))
+                continue
+            # Otherwise fine-tune from the pretrained initialisation: stored runs and score caches are discarded.
             shutil.rmtree(cfg.runs_dir / name, ignore_errors=True)
             for stale in folder.glob(f"final_{arm}_ep*_seed{seed}.json"):
                 stale.unlink()
-            cache = folder / f"final_{arm}_ep{arm_epochs[arm]}_seed{seed}.json"
             train_cfg = replace(run_cfg, val_conf=TUNING_VAL_CONF, workers=final_workers(run_cfg),
                                 train_overrides={**run_cfg.train_overrides, "max_det": max_det,
                                                  "cache": "ram"})
