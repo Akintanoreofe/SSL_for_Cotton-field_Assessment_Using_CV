@@ -73,9 +73,7 @@ def display_variant_name(variant: str) -> str:
     return VARIANT_DISPLAY_NAMES.get(variant, variant)
 
 
-# --------------------------------------------------------------------------- #
 # Weight sources shared by both protocols
-# --------------------------------------------------------------------------- #
 @dataclass
 class WeightSources:
     """Where each variant's initial weights come from.
@@ -185,9 +183,7 @@ def ultralytics_device(device: torch.device) -> str:
     return device.type
 
 
-# --------------------------------------------------------------------------- #
 # Detection: labels and dataset split
-# --------------------------------------------------------------------------- #
 def read_yolo_labels(path: Path) -> np.ndarray:
     """Read a YOLO text label file.
 
@@ -538,9 +534,7 @@ def prepare_detection_split(
     return yaml_path
 
 
-# --------------------------------------------------------------------------- #
 # Detection: fine-tuning and validation
-# --------------------------------------------------------------------------- #
 @dataclass
 class DetectionEvalConfig:
     """Settings for comparing variants by detector fine-tuning.
@@ -1205,9 +1199,7 @@ def load_training_log(run_dir: Path) -> pd.DataFrame:
     return log
 
 
-# --------------------------------------------------------------------------- #
 # Linear probe: data
-# --------------------------------------------------------------------------- #
 ANNOTATION_NAME_KEYS = ("file_name", "filename", "image", "image_name", "name", "path")
 ANNOTATION_LABEL_KEYS = ("label", "status", "class", "category", "plot_status")
 
@@ -1499,9 +1491,7 @@ def build_probe_loaders(cfg: ProbeEvalConfig) -> Tuple[DataLoader, DataLoader]:
     return train_loader, test_loader
 
 
-# --------------------------------------------------------------------------- #
 # Linear probe: model and training
-# --------------------------------------------------------------------------- #
 class LinearProbe(nn.Module):
     """Frozen backbone, multi-scale GAP features, dropout and a linear layer.
 
@@ -1767,9 +1757,7 @@ def classification_summary(labels: np.ndarray, predictions: np.ndarray,
     }
 
 
-# --------------------------------------------------------------------------- #
 # Embeddings (shared by pretraining diagnostics and probing)
-# --------------------------------------------------------------------------- #
 @torch.no_grad()
 def extract_embeddings(model: nn.Module, loader: DataLoader,
                        max_batches: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
