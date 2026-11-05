@@ -29,7 +29,14 @@ Alternatively, open [`run_gap_lejepa_pipeline.ipynb`](lejepa_cotton_gap/notebook
 
 ## Video example
 
-The repository includes an example cotton-field video, [`lejepa_cotton.mp4`](lejepa_cotton.mp4). Run a fine-tuned detector on a video with:
+Play the example cotton-field video:
+
+<video controls width="100%">
+  <source src="lejepa_cotton.mp4" type="video/mp4">
+  <a href="lejepa_cotton.mp4">Download the video</a>.
+</video>
+
+Run a fine-tuned detector on a video with:
 
 ```bash
 python -m lejepa_cotton.predict_video --weights outputs/detection/runs/lejepa/weights/best.pt \
