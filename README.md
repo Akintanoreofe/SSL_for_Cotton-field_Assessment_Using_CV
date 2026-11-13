@@ -27,14 +27,11 @@ Alternatively, open [`run_gap_lejepa_pipeline.ipynb`](lejepa_cotton_gap/notebook
 2. **Cotton-boll detection:** fine-tunes and compares LeJEPA, COCO-pretrained, COCO-backbone-only, and randomly initialized YOLOv8 variants; evaluation reports AP50, AP50-95 and AP75.
 3. **Plot-status classification:** trains a linear probe on frozen backbone features and reports classification metrics.
 
-## Video example
+## Demo Video
 
 Play the example cotton-field video:
 
-<video controls width="100%">
-  <source src="lejepa_cotton.mp4" type="video/mp4">
-  <a href="lejepa_cotton.mp4">Download the video</a>.
-</video>
+https://github.com/user-attachments/assets/47d504c8-f368-4b24-a143-d01a0ac0db0b
 
 Run a fine-tuned detector on a video with:
 
